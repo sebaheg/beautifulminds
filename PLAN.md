@@ -39,10 +39,12 @@ An immersive, mostly visual exhibition at the intersection of science and art. E
 | Penrose | Aperiodic floor | Tiles light up as you walk; the pattern never repeats |
 | Escher, Poincaré, Lobachevsky | Hyperbolic space | Walk inside a Poincaré disk; the edge is never reached |
 | Fourier | Epicycles | Draw a shape (or speak) and spinning circles reconstruct it |
+| Maryam Mirzakhani | Polygon billiards | Shoot a ball on an odd-shaped table; its path closes into a loop or fills the table forever, then the table folds into a doughnut-like surface to show why. Styled after her floor-sized doodles |
 
 ### Room 5 — Space, Time & Light
 | Mind | Piece | Interaction |
 |---|---|---|
+| Emmy Noether | Symmetry and conservation | A puck playground with live momentum and energy meters; turn a symmetry dial to tilt the floor or make physics change over time, and the meters start drifting |
 | Einstein | Curved spacetime | Visitors are masses that gravitationally lens a live camera feed |
 | Huygens & Young | Ripple tank | Fingers are wave sources; two make interference fringes |
 | Maxwell | Fields and light | Move a charge and watch its field ripple outward |
