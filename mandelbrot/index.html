@@ -1,0 +1,690 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Mandelbrot & Julia — Floor and Wall</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #05060c; overflow: hidden; touch-action: none; }
+  canvas { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; }
+  video { display: none; }
+  #err { position: fixed; inset: 0; display: none; place-items: center; color: #e8f4ff;
+         font: 16px ui-sans-serif, system-ui, sans-serif; text-align: center; padding: 2em; }
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+<canvas id="hud"></canvas>
+<video id="cam" playsinline muted></video>
+<div id="err"></div>
+
+<script type="module">
+// Mandelbrot & Julia — "Floor and wall"
+//
+// The floor is the Mandelbrot set, a map of every number c. Where the visitor stands
+// picks one c, and the wall shows the Julia set of that c: all starting points z that
+// never fly off to infinity under the rule  z ↦ z² + c.
+//
+// The two are tied by Fatou and Julia's theorem (1919): if c lies inside the Mandelbrot
+// set, its Julia set is one connected piece; if c lies outside, the Julia set crumbles
+// into infinitely many specks of dust. So stepping across the black shape's edge makes
+// the wall shatter or heal.
+//
+// The interesting Julia sets live along the edge of the shape, at scales a body can't
+// hit. So the floor dives: stand still and it zooms in around your feet, which gives
+// your steps finer and finer control; move quickly and it rises back out.
+//
+// Both views are escape-time renders on the GPU with smooth iteration counts and
+// distance-estimate shading (|z| log|z| / |z'|) to make the thin filaments glow.
+//
+// For two projectors, open ?view=floor and ?view=wall in two windows on the same machine;
+// the floor window owns the camera and sends c to the wall over a BroadcastChannel.
+
+const CFG = {
+  maxDpr: 1,              // render resolution cap; supersampling handles the edges
+  supersample: 2,         // n×n samples per pixel (auto-drops to 1 if frames get slow)
+  slowFrameMs: 28,
+  baseIter: 220,          // iterations at the home view; more are added as the floor dives
+  iterPerOctave: 45,
+  // input
+  input: 'both',          // none | camera | mouse | both  (press m to cycle, or ?input=camera)
+  track: 'top',           // 'top' = highest point of the silhouette (a raised hand, a head);
+                          // 'centroid' = middle of the body, for an overhead camera on a real floor
+  reachX: [0.1, 0.9],     // part of the camera frame that maps onto the full floor
+  reachY: [0.05, 0.8],
+  smoothCam: 0.35,        // seconds; camera positions are jittery
+  smoothPointer: 0.06,
+  pointerHoldSec: 2.5,    // a pointer overrides the camera this long after it moves
+  // the floor dives while you stand still and rises while you move
+  autoDive: true,
+  stillSpeed: 0.04,       // floor widths per second that still count as standing still
+  diveDelay: 1.2,         // seconds of stillness before diving
+  diveRate: 0.35,         // e-folds per second (×2 every ~2 s)
+  riseSpeed: 0.25,        // floor widths per second that start rising
+  riseRate: 1.2,
+  minScale: 2e-5,         // float32 runs out of digits around here
+  // attract mode
+  idleSec: 10,
+  homeSec: 3,             // time to drift back to the full view when nobody is around
+};
+
+// ---------- WebGL ----------
+const canvas = document.getElementById('gl');
+const hud = document.getElementById('hud'), hctx = hud.getContext('2d');
+const video = document.getElementById('cam');
+const gl = canvas.getContext('webgl2', { alpha: false, depth: false, stencil: false, antialias: false });
+function fail(msg) {
+  const e = document.getElementById('err'); e.textContent = msg; e.style.display = 'grid';
+  throw new Error(msg);
+}
+if (!gl) fail('This sketch needs WebGL2.');
+
+const VS = `#version 300 es
+in vec2 aPos;
+void main() { gl_Position = vec4(aPos, 0.0, 1.0); }`;
+
+const FS = `#version 300 es
+precision highp float;
+uniform vec2 uOrigin, uRes;      // viewport, in device pixels
+uniform vec2 uCenter;
+uniform float uScale;            // half the view height, in complex units
+uniform vec2 uC;
+uniform int uJulia, uMaxIter, uSS;
+uniform float uDim;              // fades the floor while the wall flashes, and vice versa
+out vec4 o;
+
+const vec3 BG = vec3(0.020, 0.024, 0.047);
+
+// cyclic gradient: night → indigo → sea → gold → cream → back to night
+vec3 gradient(float t) {
+  const vec3 k0 = vec3(0.020, 0.024, 0.047), k1 = vec3(0.075, 0.13, 0.36),
+             k2 = vec3(0.13, 0.52, 0.72),    k3 = vec3(1.0, 0.82, 0.48),
+             k4 = vec3(1.0, 0.96, 0.86);
+  t = fract(t) * 5.0;
+  if (t < 1.0) return mix(k0, k1, t);
+  if (t < 2.0) return mix(k1, k2, t - 1.0);
+  if (t < 3.0) return mix(k2, k3, t - 2.0);
+  if (t < 4.0) return mix(k3, k4, t - 3.0);
+  return mix(k4, k0, t - 4.0);
+}
+
+vec2 cmul(vec2 a, vec2 b) { return vec2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x); }
+
+vec3 sampleAt(vec2 p, float pixel) {
+  vec2 z, c, dz;
+  if (uJulia == 1) { z = p; c = uC; dz = vec2(1.0, 0.0); }
+  else {
+    z = vec2(0.0); c = p; dz = vec2(0.0);
+    // main cardioid and period-2 bulb are known to be inside: skip the iterations
+    float q = dot(p - vec2(0.25, 0.0), p - vec2(0.25, 0.0));
+    if (q * (q + p.x - 0.25) < 0.25 * p.y * p.y || dot(p + vec2(1.0, 0.0), p + vec2(1.0, 0.0)) < 0.0625)
+      return BG * 1.6;
+  }
+  float add = uJulia == 1 ? 0.0 : 1.0;
+  float n = 0.0, trap = 1e9;
+  bool escaped = false;
+  for (int i = 0; i < 6000; i++) {
+    if (i >= uMaxIter) break;
+    dz = 2.0 * cmul(z, dz) + vec2(add, 0.0);
+    z = cmul(z, z) + c;
+    float r2 = dot(z, z);
+    trap = min(trap, r2);
+    if (r2 > 1e5) { escaped = true; break; }
+    n += 1.0;
+  }
+  if (!escaped) {
+    // inside: near-black, with a faint glow from how close the orbit came to 0
+    if (uJulia == 1) return mix(BG * 1.4, vec3(0.06, 0.09, 0.22), exp(-6.0 * sqrt(trap)));
+    return BG * 1.6;
+  }
+  float r = length(z);
+  float smoothN = max(0.0, n + 1.0 - log2(log2(r)));
+  float de = 0.5 * r * log(r) / max(length(dz), 1e-30);   // distance to the set, complex units
+  float px = de / pixel;                                    // ... in pixels
+  vec3 col = gradient(0.42 * log(smoothN + 1.0) - 0.05);
+  float glow = exp(-0.6 * px) + 0.22 * exp(-0.07 * px);      // a bright rim along the boundary
+  float far = clamp(log(smoothN + 1.0) / 4.0, 0.0, 1.0);    // fade the slow-escaping halo out
+  col = col * (0.12 + 0.7 * far) + vec3(1.0, 0.86, 0.6) * 0.7 * glow;
+  return col;
+}
+
+void main() {
+  float pixel = 2.0 * uScale / uRes.y;
+  vec3 sum = vec3(0.0);
+  for (int j = 0; j < 4; j++) for (int i = 0; i < 4; i++) {
+    if (i >= uSS || j >= uSS) continue;
+    vec2 sub = (vec2(i, j) + 0.5) / float(uSS);
+    vec2 f = gl_FragCoord.xy - 0.5 + sub - uOrigin - 0.5 * uRes;
+    sum += sampleAt(uCenter + f * pixel, pixel);
+  }
+  vec3 col = sum / float(uSS * uSS);
+  o = vec4(pow(col, vec3(1.0 / 1.1)) * uDim, 1.0);
+}`;
+
+function compile(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) fail(gl.getShaderInfoLog(s));
+  return s;
+}
+const prog = gl.createProgram();
+gl.attachShader(prog, compile(gl.VERTEX_SHADER, VS));
+gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FS));
+gl.bindAttribLocation(prog, 0, 'aPos');
+gl.linkProgram(prog);
+if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) fail(gl.getProgramInfoLog(prog));
+const U = {};
+for (const n of ['uOrigin', 'uRes', 'uCenter', 'uScale', 'uC', 'uJulia', 'uMaxIter', 'uSS', 'uDim'])
+  U[n] = gl.getUniformLocation(prog, n);
+gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+gl.enableVertexAttribArray(0);
+gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+gl.useProgram(prog);
+
+// ---------- state ----------
+const params = new URLSearchParams(location.search);
+const VIEWS = ['both', 'floor', 'wall'];
+let view = Math.max(0, VIEWS.indexOf(params.get('view')));
+let W = 0, H = 0, pr = 1;
+let rects = {};                 // floor / wall rectangles in css px, or null when hidden
+let home = { x: -0.75, y: 0, s: 1.3 };
+const fv = { ...home };         // floor view: center and half-height
+let pos = null;                 // target position on the floor, uv (0..1, y down)
+let posS = null;                // smoothed
+let prevPosS = null;
+let c = { x: -0.745, y: 0.113 };
+let inside = true, insideFade = 1, flash = 0;
+let stillTime = 0, lastInput = -1e9, lastPointer = -1e9, lastRemote = -1e9;
+let attractT = 2.2;
+let ss = CFG.supersample, frameMs = 16;
+let showHud = true, showOrbit = true, showVideo = false, invertMask = false;
+let autoDive = CFG.autoDive, track = CFG.track;
+const INPUTS = ['none', 'camera', 'mouse', 'both'];
+let input = INPUTS.includes(params.get('input')) ? params.get('input') : CFG.input;
+let cam = 'off';                // off | loading | on | failed
+let segmenter = null, segmenterReady = null, camToken = 0, lastVideoTime = -1, presence = 0, camPos = null;
+const useCamera = () => input === 'camera' || input === 'both';
+const useMouse = () => input === 'mouse' || input === 'both';
+
+const channel = 'BroadcastChannel' in window ? new BroadcastChannel('beautifulminds-mandelbrot') : null;
+if (channel) channel.onmessage = (e) => {
+  if (view !== 2) return;
+  c = e.data.c; lastRemote = performance.now();
+};
+
+function fitHome(r) {
+  // the whole set, [-2.25, 0.75] × [-1.25, 1.25], with a little room around it
+  return { x: -0.72, y: 0, s: Math.max(1.32, 1.62 * r.h / r.w) };
+}
+
+function resize() {
+  W = innerWidth; H = innerHeight;
+  pr = Math.min(devicePixelRatio || 1, CFG.maxDpr);
+  canvas.width = Math.round(W * pr); canvas.height = Math.round(H * pr);
+  hud.width = Math.round(W * devicePixelRatio); hud.height = Math.round(H * devicePixelRatio);
+  hctx.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0);
+  const full = { x: 0, y: 0, w: W, h: H };
+  if (VIEWS[view] === 'floor') rects = { floor: full, wall: null };
+  else if (VIEWS[view] === 'wall') rects = { floor: null, wall: full };
+  else if (W >= H) rects = { floor: { x: 0, y: 0, w: W / 2, h: H }, wall: { x: W / 2, y: 0, w: W / 2, h: H } };
+  else rects = { floor: { x: 0, y: 0, w: W, h: H / 2 }, wall: { x: 0, y: H / 2, w: W, h: H / 2 } };
+  const r = rects.floor || full;
+  const wasHome = fv.s >= home.s * 0.999;
+  home = fitHome(r);
+  if (wasHome) Object.assign(fv, home);
+  if (posS) posS = toUv(c);   // keep standing on the same c
+}
+
+// floor uv (0..1, y down) ↔ complex number, through the current floor view
+function toComplex(u, v, f = fv) {
+  const r = rects.floor || { w: W, h: H };
+  return { x: f.x + (u - 0.5) * 2 * f.s * r.w / r.h, y: f.y - (v - 0.5) * 2 * f.s };
+}
+function toUv(z, f = fv) {
+  const r = rects.floor || { w: W, h: H };
+  return { u: (z.x - f.x) / (2 * f.s * r.w / r.h) + 0.5, v: -(z.y - f.y) / (2 * f.s) + 0.5 };
+}
+
+// zoom the floor by k, keeping the number under uv where it is
+function zoomAbout(u, v, k) {
+  const anchor = toComplex(u, v);
+  const s0 = fv.s;
+  fv.s = Math.min(home.s, Math.max(CFG.minScale, fv.s * k));
+  const z = toComplex(u, v);
+  fv.x += anchor.x - z.x; fv.y += anchor.y - z.y;
+  if (k > 1 && fv.s > s0) {
+    // on the way out, drift toward the home center so it arrives exactly at full zoom-out
+    const t = fv.s >= home.s ? 1 : Math.log(fv.s / s0) / Math.log(home.s / s0);
+    fv.x += (home.x - fv.x) * t; fv.y += (home.y - fv.y) * t;
+  }
+}
+
+// does 0 stay bounded under z ↦ z² + c?  (is c in the Mandelbrot set?)
+function inMandelbrot(cx, cy, maxIter = 2000) {
+  let x = 0, y = 0;
+  for (let i = 0; i < maxIter; i++) {
+    const nx = x * x - y * y + cx; y = 2 * x * y + cy; x = nx;
+    if (x * x + y * y > 4) return false;
+  }
+  return true;
+}
+
+// ---------- update ----------
+function update(dt, now) {
+  if (VIEWS[view] === 'wall') {
+    // c arrives from the floor window; drift on our own if it goes quiet
+    if (now - lastRemote > 2000) attract(dt);
+    finishC(dt);
+    return;
+  }
+
+  // pick the input: a recent pointer wins, then the camera
+  let target = null, tau = CFG.smoothPointer;
+  if (useMouse() && now - lastPointer < CFG.pointerHoldSec * 1000 && pos) target = pos;
+  else if (useCamera() && cam === 'on' && camPos && presence > 0.01) { target = camPos; tau = CFG.smoothCam; lastInput = now; }
+  const active = !!target;
+  if (input === 'none') lastInput = -1e9;   // no input: straight to attract mode
+
+  if (active) {
+    if (!posS) posS = { ...target };
+    const a = 1 - Math.exp(-dt / tau);
+    posS.u += (target.u - posS.u) * a; posS.v += (target.v - posS.v) * a;
+    posS.u = Math.min(1, Math.max(0, posS.u)); posS.v = Math.min(1, Math.max(0, posS.v));
+    const r = rects.floor;
+    const speed = prevPosS ? Math.hypot((posS.u - prevPosS.u), (posS.v - prevPosS.v) * r.h / r.w) / dt : 0;
+    prevPosS = { ...posS };
+    stillTime = speed < CFG.stillSpeed ? stillTime + dt : 0;
+    if (autoDive && stillTime > CFG.diveDelay) zoomAbout(posS.u, posS.v, Math.exp(-CFG.diveRate * dt));
+    if (speed > CFG.riseSpeed)
+      zoomAbout(posS.u, posS.v, Math.exp(CFG.riseRate * dt * Math.min(3, speed / CFG.riseSpeed)));
+    c = toComplex(posS.u, posS.v);
+  } else {
+    prevPosS = null; stillTime = 0;
+    if (now - lastInput > CFG.idleSec * 1000) attract(dt);
+    else if (posS) c = toComplex(posS.u, posS.v);
+  }
+  if (!active && now - lastInput > CFG.idleSec * 1000) {
+    // nobody here: float back up to the full view
+    const k = Math.exp(Math.log(home.s / fv.s) * Math.min(1, dt / CFG.homeSec * 3));
+    if (fv.s < home.s * 0.999) { const uv = toUv(c); zoomAbout(uv.u, uv.v, k); }
+    else Object.assign(fv, home);
+  }
+  finishC(dt);
+  if (channel && VIEWS[view] === 'floor') channel.postMessage({ c });
+}
+
+// attract mode: c walks slowly around the main cardioid, stepping in and out of the set
+function attract(dt) {
+  attractT += dt * 0.045;
+  const t = attractT, r = 1 + 0.045 * Math.sin(t * 5.3) + 0.02 * Math.sin(t * 13.1);
+  const ex = Math.cos(t), ey = Math.sin(t), e2x = Math.cos(2 * t), e2y = Math.sin(2 * t);
+  const target = { x: r * (ex / 2 - e2x / 4), y: r * (ey / 2 - e2y / 4) };
+  const a = 1 - Math.exp(-dt / 0.8);
+  c = { x: c.x + (target.x - c.x) * a, y: c.y + (target.y - c.y) * a };
+  posS = null;
+}
+
+function finishC(dt) {
+  const now = inMandelbrot(c.x, c.y);
+  if (now !== inside) { inside = now; flash = 1; }
+  insideFade += ((inside ? 1 : 0) - insideFade) * Math.min(1, dt * 4);
+  flash = Math.max(0, flash - dt * 1.5);
+}
+
+// ---------- render ----------
+function drawView(r, julia, center, scale, iters) {
+  const x = Math.round(r.x * pr), w = Math.round(r.w * pr);
+  const h = Math.round(r.h * pr), y = canvas.height - Math.round(r.y * pr) - h;
+  gl.viewport(x, y, w, h);
+  gl.uniform2f(U.uOrigin, x, y);
+  gl.uniform2f(U.uRes, w, h);
+  gl.uniform2f(U.uCenter, center.x, center.y);
+  gl.uniform1f(U.uScale, scale);
+  gl.uniform2f(U.uC, c.x, c.y);
+  gl.uniform1i(U.uJulia, julia ? 1 : 0);
+  gl.uniform1i(U.uMaxIter, iters);
+  gl.uniform1i(U.uSS, ss);
+  gl.uniform1f(U.uDim, 1);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+}
+
+function render() {
+  if (rects.floor) {
+    const octaves = Math.max(0, Math.log2(home.s / fv.s));
+    drawView(rects.floor, false, fv, fv.s, Math.round(CFG.baseIter + CFG.iterPerOctave * octaves));
+  }
+  if (rects.wall) {
+    const r = rects.wall;
+    // every Julia set fits in |z| ≤ 2 and most are much smaller; leave room for the text
+    drawView(r, true, { x: 0, y: 0 }, Math.max(1.5, 1.75 * r.h / r.w), 400);
+  }
+}
+
+// ---------- camera ----------
+async function startCamera() {
+  if (cam === 'loading' || cam === 'on') return;
+  cam = 'loading';
+  const token = ++camToken;     // a later start or stop makes this attempt stale
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' }, audio: false,
+    });
+    if (token !== camToken) { for (const t of stream.getTracks()) t.stop(); return; }
+    video.srcObject = stream;
+    await video.play();
+    segmenterReady ||= loadSegmenter();
+    await segmenterReady;
+    if (token === camToken) cam = 'on';
+  } catch (err) {
+    console.warn('Camera unavailable:', err);
+    if (token !== camToken) return;
+    segmenterReady = null;
+    stopCamera();
+    cam = 'failed';
+  }
+}
+
+function stopCamera() {
+  camToken++;
+  if (video.srcObject) for (const t of video.srcObject.getTracks()) t.stop();
+  video.srcObject = null;
+  cam = 'off'; camPos = null; presence = 0; lastVideoTime = -1;
+}
+
+async function loadSegmenter() {
+  const { FilesetResolver, ImageSegmenter } = await import(
+    'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs');
+  const fileset = await FilesetResolver.forVisionTasks(
+    'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm');
+  segmenter = await ImageSegmenter.createFromOptions(fileset, {
+    baseOptions: {
+      modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite',
+      delegate: 'GPU',
+    },
+    runningMode: 'VIDEO',
+    outputCategoryMask: false,
+    outputConfidenceMasks: true,
+  });
+}
+
+function setInput(i) {
+  input = i;
+  if (VIEWS[view] === 'wall') return;   // the wall gets c from the floor window
+  if (useCamera()) startCamera();
+  else stopCamera();
+  if (!useMouse()) lastPointer = -1e9;
+}
+
+function segment(now) {
+  if (cam !== 'on' || video.readyState < 2 || video.currentTime === lastVideoTime) return;
+  lastVideoTime = video.currentTime;
+  const result = segmenter.segmentForVideo(video, now);
+  const masks = result.confidenceMasks;
+  const m = masks[masks.length > 1 ? 1 : 0];
+  const mw = m.width, mh = m.height, data = m.getAsFloat32Array();
+  const on = (i) => (invertMask ? 1 - data[i] : data[i]) > 0.5;
+
+  let count = 0, sx = 0, sy = 0, top = -1;
+  for (let y = 0; y < mh; y++) {
+    let row = 0;
+    for (let x = 0; x < mw; x++) if (on(y * mw + x)) { row++; sx += x; sy += y; }
+    if (top < 0 && row >= 3) top = y;
+    count += row;
+  }
+  presence += (count / data.length - presence) * 0.3;
+  if (count < 20) { camPos = null; result.close(); return; }
+
+  let px, py;
+  if (track === 'top') {
+    // the tip of the silhouette: a raised hand, or the top of the head
+    const band = Math.max(2, Math.round(mh * 0.03));
+    let n = 0, bx = 0;
+    for (let y = top; y < Math.min(mh, top + band); y++)
+      for (let x = 0; x < mw; x++) if (on(y * mw + x)) { n++; bx += x; }
+    px = bx / n / mw; py = top / mh;
+  } else {
+    px = sx / count / mw; py = sy / count / mh;
+  }
+  result.close();
+  // mirror, so moving right moves right, and stretch the reachable part of the frame
+  const [x0, x1] = CFG.reachX, [y0, y1] = CFG.reachY;
+  camPos = { u: (1 - px - x0) / (x1 - x0), v: (py - y0) / (y1 - y0) };
+}
+
+// ---------- HUD ----------
+const COL = { text: 'rgba(232,244,255,0.9)', dim: 'rgba(232,244,255,0.55)', lit: '#ffd27a', cold: '#8fd3ff' };
+const SERIF = 'ui-serif, "Cambria Math", "STIX Two Math", Georgia, serif';
+const SANS = 'ui-sans-serif, system-ui, -apple-system, sans-serif';
+
+function fmtC(z) {
+  const n = (v) => (v < 0 ? '−' : '') + Math.abs(v).toFixed(fv.s < 1e-3 ? 6 : 4);
+  return `c = ${n(z.x)} ${z.y < 0 ? '−' : '+'} ${Math.abs(z.y).toFixed(fv.s < 1e-3 ? 6 : 4)}i`;
+}
+
+function shade(ctx, r, fromTop, h) {
+  const y0 = fromTop ? r.y : r.y + r.h - h;
+  const g = ctx.createLinearGradient(0, y0, 0, y0 + h);
+  const a = 'rgba(5,6,12,0.8)', z = 'rgba(5,6,12,0)';
+  g.addColorStop(0, fromTop ? a : z); g.addColorStop(1, fromTop ? z : a);
+  ctx.fillStyle = g; ctx.fillRect(r.x, y0, r.w, h);
+}
+
+function drawFloorHud(ctx, r, pad) {
+  // the orbit of 0: bounded inside the set, flung away outside it
+  const uv = toUv(c);
+  const mx = r.x + uv.u * r.w, my = r.y + uv.v * r.h;
+  ctx.save();
+  ctx.beginPath(); ctx.rect(r.x, r.y, r.w, r.h); ctx.clip();
+  if (showOrbit) {
+    let x = 0, y = 0;
+    ctx.strokeStyle = 'rgba(255,210,122,0.35)'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(r.x + toUv({ x, y }).u * r.w, r.y + toUv({ x, y }).v * r.h);
+    const pts = [];
+    for (let i = 0; i < 120 && x * x + y * y < 64; i++) {
+      const nx = x * x - y * y + c.x; y = 2 * x * y + c.y; x = nx;
+      const p = toUv({ x, y });
+      pts.push([r.x + p.u * r.w, r.y + p.v * r.h]);
+      ctx.lineTo(...pts[pts.length - 1]);
+    }
+    ctx.stroke();
+    pts.forEach(([px, py], i) => {
+      ctx.fillStyle = `rgba(255,210,122,${0.7 * Math.pow(0.97, i)})`;
+      ctx.beginPath(); ctx.arc(px, py, 2, 0, Math.PI * 2); ctx.fill();
+    });
+  }
+  // the marker: where you stand
+  const pulse = 1 + 0.15 * Math.sin(performance.now() / 300);
+  ctx.strokeStyle = inside ? COL.lit : COL.cold; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.arc(mx, my, 11 * pulse, 0, Math.PI * 2); ctx.stroke();
+  ctx.fillStyle = inside ? COL.lit : COL.cold;
+  ctx.beginPath(); ctx.arc(mx, my, 3, 0, Math.PI * 2); ctx.fill();
+  if (autoDive && stillTime > 0.3 && stillTime < CFG.diveDelay) {
+    // charging ring before a dive starts
+    ctx.beginPath(); ctx.arc(mx, my, 18, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * stillTime / CFG.diveDelay);
+    ctx.strokeStyle = 'rgba(232,244,255,0.5)'; ctx.lineWidth = 1.5; ctx.stroke();
+  }
+  ctx.restore();
+
+  if (!showHud) return;
+  shade(ctx, r, true, pad + 80);
+  shade(ctx, r, false, 110);
+  ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+  ctx.fillStyle = 'rgba(232,244,255,0.85)';
+  ctx.font = `300 22px ${SERIF}`;
+  ctx.fillText('Every point of this shape holds a whole world.', r.x + pad, r.y + pad + 22);
+  ctx.font = `400 13px ${SANS}`; ctx.fillStyle = COL.dim;
+  ctx.fillText('Benoît Mandelbrot, 1980', r.x + pad, r.y + pad + 44);
+
+  const zoom = home.s / fv.s;
+  ctx.font = `400 14px ${SANS}`; ctx.fillStyle = COL.text;
+  ctx.fillText('Where you stand is c.', r.x + pad, r.y + r.h - pad - 24);
+  ctx.fillStyle = COL.dim; ctx.font = `400 13px ${SANS}`;
+  const hint = !autoDive ? 'scroll to zoom'
+    : zoom > 1.05 ? `${Math.round(zoom).toLocaleString('en')}× deeper  ·  move quickly to rise`
+    : 'stand still to dive in  ·  move quickly to rise';
+  ctx.fillText(hint, r.x + pad, r.y + r.h - pad - 4);
+
+  // top right: input mode selector, and what the camera is doing
+  ctx.textAlign = 'right'; ctx.font = `400 13px ${SANS}`;
+  let rx = r.x + r.w - pad;
+  for (let i = INPUTS.length - 1; i >= 0; i--) {
+    ctx.fillStyle = INPUTS[i] === input ? COL.lit : COL.dim;
+    ctx.fillText(INPUTS[i], rx, r.y + pad + 16);
+    rx -= ctx.measureText(INPUTS[i]).width + 14;
+  }
+  ctx.fillStyle = COL.dim;
+  ctx.fillText('m', rx - 4, r.y + pad + 16);
+  const status = {
+    none: 'no input — drifting on its own',
+    camera: { off: '', loading: 'starting camera…', on: '', failed: 'camera unavailable — press m for the mouse' }[cam],
+    mouse: 'move the mouse over the floor',
+    both: { off: '', loading: 'starting camera…', on: '', failed: 'camera unavailable — mouse only' }[cam],
+  }[input];
+  if (status) ctx.fillText(status, r.x + r.w - pad, r.y + pad + 38);
+  ctx.textAlign = 'left';
+}
+
+function drawWallHud(ctx, r, pad) {
+  if (flash > 0) {
+    ctx.fillStyle = inside ? `rgba(255,210,122,${0.12 * flash})` : `rgba(143,211,255,${0.12 * flash})`;
+    ctx.fillRect(r.x, r.y, r.w, r.h);
+  }
+  if (!showHud) return;
+  shade(ctx, r, true, pad + 80);
+  shade(ctx, r, false, 170);
+  ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+  ctx.fillStyle = 'rgba(232,244,255,0.85)';
+  ctx.font = `300 22px ${SERIF}`;
+  ctx.fillText('…and this is the world at c.', r.x + pad, r.y + pad + 22);
+  ctx.font = `400 13px ${SANS}`; ctx.fillStyle = COL.dim;
+  ctx.fillText('Gaston Julia & Pierre Fatou, 1918', r.x + pad, r.y + pad + 44);
+
+  const big = Math.min(32, r.w / 16);
+  const yEq = r.y + r.h - pad - 74;
+  ctx.font = `italic 400 ${big}px ${SERIF}`;
+  ctx.fillStyle = COL.text;
+  ctx.fillText('z ↦ z² + c', r.x + pad, yEq);
+  const ew = ctx.measureText('z ↦ z² + c').width;
+  ctx.font = `400 14px ${SANS}`; ctx.fillStyle = COL.dim;
+  ctx.fillText(fmtC(c), r.x + pad + ew + 18, yEq);
+  ctx.fillText('Square a point, add c, repeat. The points that never fly away form this shape.', r.x + pad, yEq + 28);
+
+  // the theorem, lit by which side of the edge c is on
+  const a = insideFade;
+  ctx.font = `400 15px ${SANS}`;
+  ctx.fillStyle = `rgba(255,210,122,${0.2 + 0.8 * a})`;
+  ctx.fillText('c inside the Mandelbrot set: one connected piece.', r.x + pad, yEq + 56);
+  ctx.fillStyle = `rgba(143,211,255,${0.2 + 0.8 * (1 - a)})`;
+  ctx.fillText('c outside it: the piece shatters into dust.', r.x + pad, yEq + 78);
+
+  if (r.w > 900) {
+    ctx.textAlign = 'right';
+    ctx.fillStyle = 'rgba(232,244,255,0.4)';
+    ctx.font = `400 12px ${SANS}`;
+    ctx.fillText('The edge of the Mandelbrot set is so crinkled that it is, in a sense, two-dimensional:', r.x + r.w - pad, r.y + r.h - pad - 24);
+    ctx.fillText('its boundary has Hausdorff dimension 2 (Shishikura, 1998).', r.x + r.w - pad, r.y + r.h - pad - 6);
+    ctx.textAlign = 'left';
+  }
+}
+
+function drawHud() {
+  const ctx = hctx;
+  ctx.clearRect(0, 0, W, H);
+  if (showVideo && cam === 'on' && rects.floor) {
+    const r = rects.floor, vw = video.videoWidth, vh = video.videoHeight, s = Math.max(r.w / vw, r.h / vh);
+    ctx.save(); ctx.globalAlpha = 0.25;
+    ctx.beginPath(); ctx.rect(r.x, r.y, r.w, r.h); ctx.clip();
+    ctx.translate(r.x + r.w, r.y); ctx.scale(-1, 1);
+    ctx.drawImage(video, (r.w - vw * s) / 2, (r.h - vh * s) / 2, vw * s, vh * s);
+    ctx.restore();
+  }
+  const pad = Math.max(20, Math.min(W, H) * 0.03);
+  // the floor gets bright when you dive into the filaments; keep the text legible
+  ctx.shadowColor = 'rgba(5,6,12,0.9)'; ctx.shadowBlur = 8;
+  if (rects.floor) drawFloorHud(ctx, rects.floor, pad);
+  if (rects.wall) drawWallHud(ctx, rects.wall, pad);
+  if (rects.floor && rects.wall) {
+    ctx.strokeStyle = 'rgba(232,244,255,0.12)'; ctx.lineWidth = 1;
+    ctx.beginPath();
+    if (rects.wall.x > 0) { ctx.moveTo(rects.wall.x + 0.5, 0); ctx.lineTo(rects.wall.x + 0.5, H); }
+    else { ctx.moveTo(0, rects.wall.y + 0.5); ctx.lineTo(W, rects.wall.y + 0.5); }
+    ctx.stroke();
+  }
+  ctx.shadowBlur = 0;
+}
+
+// ---------- main loop ----------
+let last = performance.now(), slowFrames = 0;
+function frame(now) {
+  const raw = now - last;
+  const dt = Math.min(raw / 1000, 1 / 20);
+  last = now;
+  frameMs += (raw - frameMs) * 0.05;
+  if (ss > 1 && frameMs > CFG.slowFrameMs && ++slowFrames > 60) { ss = 1; slowFrames = 0; console.info('mandelbrot: supersampling off'); }
+  segment(now);
+  update(dt, now);
+  render();
+  drawHud();
+  requestAnimationFrame(frame);
+}
+
+function floorUv(e) {
+  const r = rects.floor;
+  if (!r) return null;
+  const u = (e.clientX - r.x) / r.w, v = (e.clientY - r.y) / r.h;
+  return u >= 0 && u <= 1 && v >= 0 && v <= 1 ? { u, v } : null;
+}
+function pointer(e) {
+  if (!useMouse()) return;
+  const p = floorUv(e);
+  if (!p) return;
+  pos = p;
+  lastPointer = lastInput = performance.now();
+}
+window.addEventListener('pointerdown', pointer);
+window.addEventListener('pointermove', pointer);
+window.addEventListener('wheel', (e) => {
+  if (!useMouse()) return;
+  const p = floorUv(e);
+  if (!p) return;
+  e.preventDefault();
+  zoomAbout(p.u, p.v, Math.exp(e.deltaY * 0.0015));
+  lastInput = performance.now();
+}, { passive: false });
+window.addEventListener('resize', resize);
+window.addEventListener('keydown', (e) => {
+  if (e.key >= '1' && e.key <= '3') { view = +e.key - 1; resize(); }
+  else if (e.key === 'f') document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen();
+  else if (e.key === 'r') Object.assign(fv, home);
+  else if (e.key === 'z') autoDive = !autoDive;
+  else if (e.key === 'o') showOrbit = !showOrbit;
+  else if (e.key === 't') track = track === 'top' ? 'centroid' : 'top';
+  else if (e.key === 'v') showVideo = !showVideo;
+  else if (e.key === 'h') showHud = !showHud;
+  else if (e.key === 'i') invertMask = !invertMask;
+  else if (e.key === 'm') setInput(INPUTS[(INPUTS.indexOf(input) + 1) % INPUTS.length]);
+  else if (e.key === 's') ss = ss === 1 ? CFG.supersample : 1;
+});
+
+// Debug hook for tuning from the console: mandelbrot.state(), mandelbrot.CFG
+window.mandelbrot = {
+  CFG,
+  state() {
+    return { input, camera: cam, view: VIEWS[view], c, inside, zoom: home.s / fv.s, floor: { ...fv }, track, presence,
+             camPos, supersample: ss, frameMs: +frameMs.toFixed(1) };
+  },
+  go(x, y, s) { c = { x, y }; if (s) { fv.x = x; fv.y = y; fv.s = s; } lastInput = performance.now(); posS = toUv(c); },
+};
+
+resize();
+// deep links for tuning and for sharing a spot: ?c=-0.745,0.113&s=0.002
+if (params.get('c')) {
+  const [x, y] = params.get('c').split(',').map(Number);
+  window.mandelbrot.go(x, y, params.get('s') ? +params.get('s') : 0);
+}
+requestAnimationFrame(frame);
+setInput(input);
+</script>
+</body>
+</html>

@@ -1,0 +1,804 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Navier–Stokes — Fluid Wall</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #05060c; overflow: hidden; touch-action: none; }
+  canvas { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; }
+  video { display: none; }
+  #err { position: fixed; inset: 0; display: none; place-items: center; color: #e8f4ff;
+         font: 16px ui-sans-serif, system-ui, sans-serif; text-align: center; padding: 2em; }
+</style>
+</head>
+<body>
+<canvas id="sim"></canvas>
+<canvas id="hud"></canvas>
+<video id="cam" playsinline muted></video>
+<div id="err"></div>
+
+<script type="module">
+// Navier–Stokes — "Fluid wall"
+//
+// An incompressible fluid fills the wall. A visitor's silhouette is tracked by the
+// camera; wherever its edge moves, the fluid there is dragged along at the speed of
+// the edge (estimated from how the blurred mask changes between frames), and ink is
+// released. Faster hands push harder. The body's interior is a soft obstacle, so the
+// flow curls around you.
+//
+// The solver is the classic "stable fluids" scheme (Stam 1999) on the GPU:
+//   ∂u/∂t + (u·∇)u = −∇p + ν∇²u + f,   ∇·u = 0
+//   advection  → semi-Lagrangian back-tracing        (u·∇)u
+//   viscosity  → implicit Jacobi diffusion           ν∇²u
+//   you        → silhouette / pointer forces         f
+//   pressure   → Jacobi Poisson solve + projection   −∇p, ∇·u = 0
+// plus vorticity confinement to keep the small swirls the coarse grid would smear out.
+//
+// Velocity is stored in sim-grid cells per second; positions in [0,1] uv.
+
+const CFG = {
+  simRes: 192,            // velocity/pressure grid, cells along the short side
+  dyeRes: 900,            // ink resolution along the short side
+  pressureIters: 30,
+  viscIters: 20,
+  viscosities: [0, 2, 8, 32, 128, 512],   // ν in cells²/s, "water" → "honey"
+  viscDefault: 1,
+  velDissipation: 0.15,   // per second
+  dyeDissipation: 0.35,
+  vorticity: 4,           // confinement strength (scaled down as viscosity rises); above ~8 it
+                          // amplifies half-float noise into grid-scale speckle
+  pressureDecay: 0.8,     // warm-start the pressure solve from 80% of last frame's
+  // body (camera) input
+  maskRadius: 0.035,      // blur of the silhouette edge, in screen heights; wider = catches faster hands
+  bodyStrength: 0.6,      // how firmly a moving edge sets the fluid's velocity (0..1 per frame)
+  bodyGain: 1.4,          // fluid speed relative to edge speed
+  bodyMaxSpeed: 3,        // screen heights per second
+  bodyDrag: 0.12,         // damping inside the body, per frame
+  bodyInk: 5,
+  bodyInkSpeed: 0.6,      // edge speed (heights/s) that releases full-strength ink
+  // pointer input
+  splatRadius: 0.0018,    // gaussian width², in screen heights²
+  pointerGain: 1.2,
+  pointerMaxSpeed: 4,
+  // attract mode
+  idleSec: 12,
+  showBody: 0.06,
+};
+
+// ---------- WebGL setup ----------
+const canvas = document.getElementById('sim');
+const hud = document.getElementById('hud'), hctx = hud.getContext('2d');
+const video = document.getElementById('cam');
+const gl = canvas.getContext('webgl2', { alpha: false, depth: false, stencil: false, antialias: false });
+function fail(msg) {
+  const e = document.getElementById('err'); e.textContent = msg; e.style.display = 'grid';
+  throw new Error(msg);
+}
+if (!gl) fail('This sketch needs WebGL2.');
+if (!gl.getExtension('EXT_color_buffer_float') && !gl.getExtension('EXT_color_buffer_half_float'))
+  fail('This sketch needs float render targets (EXT_color_buffer_float).');
+
+const VS = `#version 300 es
+precision highp float;
+in vec2 aPos;
+uniform vec2 texelSize;
+out vec2 vUv, vL, vR, vT, vB;
+void main() {
+  vUv = aPos * 0.5 + 0.5;
+  vL = vUv - vec2(texelSize.x, 0.0); vR = vUv + vec2(texelSize.x, 0.0);
+  vT = vUv + vec2(0.0, texelSize.y); vB = vUv - vec2(0.0, texelSize.y);
+  gl_Position = vec4(aPos, 0.0, 1.0);
+}`;
+
+const HEADER = `#version 300 es
+precision highp float;
+precision highp sampler2D;
+in vec2 vUv, vL, vR, vT, vB;
+uniform vec2 texelSize;
+out vec4 o;
+vec3 hsv2rgb(vec3 c) {
+  vec3 p = abs(fract(c.xxx + vec3(0.0, 2.0, 1.0) / 3.0) * 6.0 - 3.0);
+  return c.z * mix(vec3(1.0), clamp(p - 1.0, 0.0, 1.0), c.y);
+}
+`;
+
+// Velocity of the silhouette's edge from two blurred masks ("normal flow"):
+// along the edge, m(x, t) moves with speed v, so ∂m/∂t = −v·∇m  →  v = −(∂m/∂t) ∇m / |∇m|².
+// Works in screen-height units so the direction is right on any aspect ratio.
+const BODY_MOTION = `
+uniform sampler2D uMaskCur, uMaskPrev;
+uniform vec2 uMaskTexel;
+uniform float uInvDt, uAspect, uRadius;
+vec3 bodyMotion(vec2 uv) {
+  vec2 dx = vec2(uMaskTexel.x, 0.0), dy = vec2(0.0, uMaskTexel.y);
+  float gx = texture(uMaskCur, uv + dx).r - texture(uMaskCur, uv - dx).r
+           + texture(uMaskPrev, uv + dx).r - texture(uMaskPrev, uv - dx).r;
+  float gy = texture(uMaskCur, uv + dy).r - texture(uMaskCur, uv - dy).r
+           + texture(uMaskPrev, uv + dy).r - texture(uMaskPrev, uv - dy).r;
+  vec2 g = vec2(gx / (4.0 * uMaskTexel.x * uAspect), gy / (4.0 * uMaskTexel.y));
+  float dmdt = (texture(uMaskCur, uv).r - texture(uMaskPrev, uv).r) * uInvDt;
+  float gmax = 0.8 / uRadius;            // steepest slope of a step blurred with σ = radius/2
+  vec2 v = -dmdt * g / (dot(g, g) + 0.05 * gmax * gmax);
+  return vec3(v, clamp(length(g) / gmax, 0.0, 1.0));
+}
+`;
+
+const FS = {
+  copy: `uniform sampler2D uTexture; void main() { o = texture(uTexture, vUv); }`,
+
+  scale: `uniform sampler2D uTexture; uniform float value;
+    void main() { o = value * texture(uTexture, vUv); }`,
+
+  splat: `uniform sampler2D uTarget; uniform float aspect, radius; uniform vec2 point; uniform vec3 color;
+    void main() {
+      vec2 p = vUv - point; p.x *= aspect;
+      o = vec4(texture(uTarget, vUv).xyz + exp(-dot(p, p) / radius) * color, 1.0);
+    }`,
+
+  advect: `uniform sampler2D uVelocity, uSource; uniform float dt, dissipation;
+    void main() {
+      vec2 coord = vUv - dt * texture(uVelocity, vUv).xy * texelSize;
+      o = texture(uSource, coord) / (1.0 + dissipation * dt);
+    }`,
+
+  divergence: `uniform sampler2D uVelocity;
+    void main() {
+      float L = texture(uVelocity, vL).x, R = texture(uVelocity, vR).x;
+      float T = texture(uVelocity, vT).y, B = texture(uVelocity, vB).y;
+      vec2 C = texture(uVelocity, vUv).xy;
+      // solid walls: mirror the normal velocity
+      if (vL.x < 0.0) L = -C.x; if (vR.x > 1.0) R = -C.x;
+      if (vT.y > 1.0) T = -C.y; if (vB.y < 0.0) B = -C.y;
+      o = vec4(0.5 * (R - L + T - B), 0.0, 0.0, 1.0);
+    }`,
+
+  curl: `uniform sampler2D uVelocity;
+    void main() {
+      float L = texture(uVelocity, vL).y, R = texture(uVelocity, vR).y;
+      float T = texture(uVelocity, vT).x, B = texture(uVelocity, vB).x;
+      o = vec4(0.5 * (R - L - T + B), 0.0, 0.0, 1.0);
+    }`,
+
+  vorticity: `uniform sampler2D uVelocity, uCurl; uniform float curl, dt;
+    void main() {
+      float L = texture(uCurl, vL).x, R = texture(uCurl, vR).x;
+      float T = texture(uCurl, vT).x, B = texture(uCurl, vB).x, C = texture(uCurl, vUv).x;
+      vec2 force = 0.5 * vec2(abs(T) - abs(B), abs(R) - abs(L));
+      force /= length(force) + 1e-4;
+      force *= curl * C; force.y *= -1.0;
+      vec2 vel = texture(uVelocity, vUv).xy + force * dt;
+      o = vec4(clamp(vel, -2000.0, 2000.0), 0.0, 1.0);
+    }`,
+
+  // one Jacobi sweep of (I − α∇²) u = u*
+  viscosity: `uniform sampler2D uVelocity, uB; uniform float alpha;
+    void main() {
+      vec2 L = texture(uVelocity, vL).xy, R = texture(uVelocity, vR).xy;
+      vec2 T = texture(uVelocity, vT).xy, B = texture(uVelocity, vB).xy;
+      o = vec4((texture(uB, vUv).xy + alpha * (L + R + T + B)) / (1.0 + 4.0 * alpha), 0.0, 1.0);
+    }`,
+
+  // one Jacobi sweep of ∇²p = ∇·u
+  pressure: `uniform sampler2D uPressure, uDivergence;
+    void main() {
+      float L = texture(uPressure, vL).x, R = texture(uPressure, vR).x;
+      float T = texture(uPressure, vT).x, B = texture(uPressure, vB).x;
+      o = vec4((L + R + B + T - texture(uDivergence, vUv).x) * 0.25, 0.0, 0.0, 1.0);
+    }`,
+
+  gradientSubtract: `uniform sampler2D uPressure, uVelocity;
+    void main() {
+      float L = texture(uPressure, vL).x, R = texture(uPressure, vR).x;
+      float T = texture(uPressure, vT).x, B = texture(uPressure, vB).x;
+      o = vec4(texture(uVelocity, vUv).xy - 0.5 * vec2(R - L, T - B), 0.0, 1.0);
+    }`,
+
+  // camera mask → screen space: cover-fit, mirrored, thresholded (so thin arms count as much
+  // as the torso), then blurred. x = blurred edge, y = hard mask.
+  maskPrep: `uniform sampler2D uCam; uniform vec2 uScale; uniform float uRadius, uAspect, uInvert;
+    float cam(vec2 s) {
+      vec2 c = vec2(0.5 - (s.x - 0.5) * uScale.x, 0.5 + (0.5 - s.y) * uScale.y);
+      if (c.x < 0.0 || c.x > 1.0 || c.y < 0.0 || c.y > 1.0) return 0.0;
+      float m = texture(uCam, c).r;
+      return smoothstep(0.35, 0.65, mix(m, 1.0 - m, uInvert));
+    }
+    void main() {
+      float sum = 0.0, wsum = 0.0;
+      for (int j = -3; j <= 3; j++) for (int i = -3; i <= 3; i++) {
+        vec2 off = vec2(float(i), float(j)) / 3.0 * uRadius; off.x /= uAspect;
+        float w = exp(-float(i * i + j * j) / 4.5);
+        sum += w * cam(vUv + off); wsum += w;
+      }
+      o = vec4(sum / wsum, cam(vUv), 0.0, 1.0);
+    }`,
+
+  bodyVelocity: BODY_MOTION + `uniform sampler2D uVelocity; uniform float uSimH, uMaxSpeed, uStrength, uGain, uDrag;
+    void main() {
+      vec2 vel = texture(uVelocity, vUv).xy;
+      vec3 b = bodyMotion(vUv);
+      vec2 vb = b.xy * uGain;
+      float s = length(vb);
+      if (s > uMaxSpeed) vb *= uMaxSpeed / s;
+      // only where the edge actually moves, so a still body doesn't freeze the flow at its outline
+      float w = b.z * uStrength * smoothstep(0.02, 0.1, length(b.xy));
+      vel = mix(vel, vb * uSimH, w);
+      vel *= 1.0 - uDrag * texture(uMaskCur, vUv).g;
+      o = vec4(vel, 0.0, 1.0);
+    }`,
+
+  bodyDye: BODY_MOTION + `uniform sampler2D uTarget; uniform float uHue, uGain, uDt, uRefSpeed;
+    void main() {
+      vec3 b = bodyMotion(vUv);
+      float amt = b.z * smoothstep(0.05, uRefSpeed, length(b.xy)) * uGain * uDt;
+      vec3 c = hsv2rgb(vec3(fract(uHue + vUv.x * 0.35 + vUv.y * 0.1), 0.85, 1.0));
+      o = vec4(texture(uTarget, vUv).rgb + c * amt, 1.0);
+    }`,
+
+  display: `uniform sampler2D uDye, uVelocity, uPressure, uCurl, uMask;
+    uniform int uView; uniform float uVelScale, uPScale, uCurlScale, uBody;
+    vec3 diverging(float x, vec3 neg, vec3 pos, vec3 bg) {
+      return x > 0.0 ? mix(bg, pos, 1.0 - exp(-x)) : mix(bg, neg, 1.0 - exp(x));
+    }
+    void main() {
+      vec3 bg = vec3(0.02, 0.024, 0.047), col;
+      if (uView == 0) {
+        vec3 c = texture(uDye, vUv).rgb;
+        // light the ink from the front so it reads as a thick, wet surface
+        float dx = length(texture(uDye, vR).rgb) - length(texture(uDye, vL).rgb);
+        float dy = length(texture(uDye, vT).rgb) - length(texture(uDye, vB).rgb);
+        vec3 n = normalize(vec3(dx, dy, length(texelSize)));
+        c *= clamp(n.z + 0.7, 0.7, 1.0);
+        col = bg + (1.0 - exp(-c * 1.6));
+      } else if (uView == 1) {
+        vec2 v = texture(uVelocity, vUv).xy * uVelScale;
+        float hue = atan(v.y, v.x) / 6.2831853 + 0.5;
+        col = mix(bg, hsv2rgb(vec3(hue, 0.7, 1.0)), 1.0 - exp(-length(v) * 1.5));
+      } else if (uView == 2) {
+        col = diverging(texture(uPressure, vUv).x * uPScale, vec3(0.25, 0.55, 1.0), vec3(1.0, 0.55, 0.25), bg);
+      } else {
+        col = diverging(texture(uCurl, vUv).x * uCurlScale, vec3(0.3, 0.95, 0.85), vec3(1.0, 0.35, 0.7), bg);
+      }
+      col += vec3(0.6, 0.5, 1.0) * texture(uMask, vUv).g * uBody;
+      o = vec4(col, 1.0);
+    }`,
+};
+
+function compile(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s) + '\n' + src);
+  return s;
+}
+const vs = compile(gl.VERTEX_SHADER, VS);
+function program(fs) {
+  const p = gl.createProgram();
+  gl.attachShader(p, vs); gl.attachShader(p, compile(gl.FRAGMENT_SHADER, HEADER + fs));
+  gl.bindAttribLocation(p, 0, 'aPos');
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  const u = {};
+  for (let i = 0, n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS); i < n; i++) {
+    const name = gl.getActiveUniform(p, i).name;
+    u[name] = gl.getUniformLocation(p, name);
+  }
+  // uniforms the compiler optimised away resolve to null, which WebGL ignores
+  return { p, u: new Proxy(u, { get: (t, k) => t[k] ?? null }) };
+}
+const P = Object.fromEntries(Object.entries(FS).map(([k, src]) => [k, program(src)]));
+
+gl.bindVertexArray(gl.createVertexArray());
+gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+gl.enableVertexAttribArray(0);
+gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+
+let current = null;
+function use(prog) { gl.useProgram(prog.p); current = prog; return prog.u; }
+function tex(unit, target) {
+  gl.activeTexture(gl.TEXTURE0 + unit);
+  gl.bindTexture(gl.TEXTURE_2D, target.tex ?? target);
+  return unit;
+}
+function blit(target) {
+  if (target) { gl.bindFramebuffer(gl.FRAMEBUFFER, target.fbo); gl.viewport(0, 0, target.w, target.h); }
+  else { gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight); }
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+}
+
+function makeTexture(w, h, internal, format, type, filter) {
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texImage2D(gl.TEXTURE_2D, 0, internal, w, h, 0, format, type, null);
+  return t;
+}
+function target(w, h, internal, format) {
+  gl.activeTexture(gl.TEXTURE0);
+  const t = makeTexture(w, h, internal, format, gl.HALF_FLOAT, gl.LINEAR);
+  const fbo = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0);
+  if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) fail('Float render targets are not supported here.');
+  gl.viewport(0, 0, w, h); gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT);
+  return { tex: t, fbo, w, h, texel: [1 / w, 1 / h] };
+}
+function double(w, h, internal, format) {
+  let a = target(w, h, internal, format), b = target(w, h, internal, format);
+  return { get read() { return a; }, get write() { return b; }, swap() { [a, b] = [b, a]; }, w, h, texel: a.texel };
+}
+
+// ---------- state ----------
+let W = 0, H = 0, dpr = 1, aspect = 1;
+let simW, simH, vel, velB, dye, pressure, divergence, curl, maskCur, maskPrev;
+let viscIndex = CFG.viscDefault, view = 0, showHud = true, showVideo = false, showBody = true, invertMask = false;
+const VIEWS = ['ink', 'velocity', 'pressure', 'swirl'];
+
+const camTex = makeTexture(1, 1, gl.R8, gl.RED, gl.UNSIGNED_BYTE, gl.LINEAR);
+let mode = 'loading', segmenter = null, lastVideoTime = -1, haveMask = false;
+let camInvDt = 0, lastSeg = 0, maskU8 = null, prevU8 = null;
+let drive = 0, bodyMotionLevel = 0, presence = 0;
+let lastInput = performance.now(), nextGhost = 0;
+const pointers = new Map();
+
+function resize() {
+  dpr = Math.min(window.devicePixelRatio || 1, 2);
+  W = window.innerWidth; H = window.innerHeight; aspect = W / H;
+  canvas.width = Math.round(W * dpr); canvas.height = Math.round(H * dpr);
+  hud.width = canvas.width; hud.height = canvas.height;
+  hctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const size = (res) => {
+    const short = Math.min(res, gl.getParameter(gl.MAX_TEXTURE_SIZE));
+    return aspect >= 1 ? [Math.round(short * aspect), short] : [short, Math.round(short / aspect)];
+  };
+  [simW, simH] = size(CFG.simRes);
+  const [dw, dh] = size(CFG.dyeRes);
+  vel = double(simW, simH, gl.RG16F, gl.RG);
+  velB = target(simW, simH, gl.RG16F, gl.RG);
+  dye = double(dw, dh, gl.RGBA16F, gl.RGBA);
+  pressure = double(simW, simH, gl.R16F, gl.RED);
+  divergence = target(simW, simH, gl.R16F, gl.RED);
+  curl = target(simW, simH, gl.R16F, gl.RED);
+  maskCur = target(simW, simH, gl.RG16F, gl.RG);
+  maskPrev = target(simW, simH, gl.RG16F, gl.RG);
+  haveMask = false;
+}
+
+function reset() {
+  gl.clearColor(0, 0, 0, 1);
+  for (const t of [vel.read, vel.write, dye.read, dye.write, pressure.read, pressure.write]) {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, t.fbo); gl.clear(gl.COLOR_BUFFER_BIT);
+  }
+}
+
+// ---------- solver ----------
+function splat(x, y, fx, fy, color) {
+  let u = use(P.splat);
+  gl.uniform1f(u.aspect, aspect);
+  gl.uniform2f(u.point, x, y);
+  gl.uniform1f(u.radius, CFG.splatRadius);
+  gl.uniform1i(u.uTarget, tex(0, vel.read));
+  gl.uniform3f(u.color, fx, fy, 0);
+  blit(vel.write); vel.swap();
+  gl.uniform1i(u.uTarget, tex(0, dye.read));
+  gl.uniform3f(u.color, ...color);
+  blit(dye.write); dye.swap();
+}
+
+function setBodyUniforms(u) {
+  gl.uniform1i(u.uMaskCur, tex(1, maskCur));
+  gl.uniform1i(u.uMaskPrev, tex(2, maskPrev));
+  gl.uniform2f(u.uMaskTexel, ...maskCur.texel);
+  gl.uniform1f(u.uInvDt, camInvDt);
+  gl.uniform1f(u.uAspect, aspect);
+  gl.uniform1f(u.uRadius, CFG.maskRadius);
+}
+
+function step(dt, now) {
+  const nu = CFG.viscosities[viscIndex];
+  const bodyActive = mode === 'camera' && haveMask && camInvDt > 0;
+  let u;
+
+  // vorticity confinement: re-inject the small swirls numerical diffusion eats
+  u = use(P.curl);
+  gl.uniform2f(u.texelSize, ...vel.texel);
+  gl.uniform1i(u.uVelocity, tex(0, vel.read));
+  blit(curl);
+  u = use(P.vorticity);
+  gl.uniform2f(u.texelSize, ...vel.texel);
+  gl.uniform1i(u.uVelocity, tex(0, vel.read));
+  gl.uniform1i(u.uCurl, tex(1, curl));
+  gl.uniform1f(u.curl, CFG.vorticity / (1 + nu / 8));
+  gl.uniform1f(u.dt, dt);
+  blit(vel.write); vel.swap();
+
+  // f: the body drags the fluid at its moving edges
+  if (bodyActive) {
+    u = use(P.bodyVelocity);
+    setBodyUniforms(u);
+    gl.uniform1i(u.uVelocity, tex(0, vel.read));
+    gl.uniform1f(u.uSimH, simH);
+    gl.uniform1f(u.uMaxSpeed, CFG.bodyMaxSpeed);
+    gl.uniform1f(u.uStrength, CFG.bodyStrength);
+    gl.uniform1f(u.uGain, CFG.bodyGain);
+    gl.uniform1f(u.uDrag, CFG.bodyDrag);
+    blit(vel.write); vel.swap();
+  }
+
+  // f: pointers and touches
+  let pointerSpeed = 0;
+  for (const p of pointers.values()) {
+    const dx = (p.x - p.px) / H, dy = -(p.y - p.py) / H;   // screen heights
+    p.px = p.x; p.py = p.y;
+    if (!dx && !dy) continue;
+    let sx = dx / dt, sy = dy / dt;
+    const s = Math.hypot(sx, sy), k = Math.min(1, CFG.pointerMaxSpeed / s);
+    sx *= k; sy *= k;
+    pointerSpeed = Math.max(pointerSpeed, s * k);
+    const ink = Math.min(1, s / 1.5) * 0.5;
+    const c = hsv(p.hue + now * 0.00005, 0.85, ink);
+    splat(p.x / W, 1 - p.y / H, sx * simH * CFG.pointerGain, sy * simH * CFG.pointerGain, c);
+  }
+  drive += (Math.max(Math.min(1, pointerSpeed / 1.5), Math.min(1, bodyMotionLevel)) - drive) * 0.08;
+
+  // ν∇²u: implicit viscous diffusion
+  if (nu > 0) {
+    u = use(P.copy);
+    gl.uniform1i(u.uTexture, tex(0, vel.read));
+    blit(velB);
+    u = use(P.viscosity);
+    gl.uniform2f(u.texelSize, ...vel.texel);
+    gl.uniform1f(u.alpha, nu * dt);
+    gl.uniform1i(u.uB, tex(1, velB));
+    for (let i = 0; i < CFG.viscIters; i++) {
+      gl.uniform1i(u.uVelocity, tex(0, vel.read));
+      blit(vel.write); vel.swap();
+    }
+  }
+
+  // ∇·u = 0: solve for the pressure that removes divergence, then subtract its gradient
+  u = use(P.divergence);
+  gl.uniform2f(u.texelSize, ...vel.texel);
+  gl.uniform1i(u.uVelocity, tex(0, vel.read));
+  blit(divergence);
+  u = use(P.scale);
+  gl.uniform1i(u.uTexture, tex(0, pressure.read));
+  gl.uniform1f(u.value, CFG.pressureDecay);
+  blit(pressure.write); pressure.swap();
+  u = use(P.pressure);
+  gl.uniform2f(u.texelSize, ...vel.texel);
+  gl.uniform1i(u.uDivergence, tex(1, divergence));
+  for (let i = 0; i < CFG.pressureIters; i++) {
+    gl.uniform1i(u.uPressure, tex(0, pressure.read));
+    blit(pressure.write); pressure.swap();
+  }
+  u = use(P.gradientSubtract);
+  gl.uniform2f(u.texelSize, ...vel.texel);
+  gl.uniform1i(u.uPressure, tex(0, pressure.read));
+  gl.uniform1i(u.uVelocity, tex(1, vel.read));
+  blit(vel.write); vel.swap();
+
+  // (u·∇)u: the flow carries itself, and the ink
+  u = use(P.advect);
+  gl.uniform2f(u.texelSize, ...vel.texel);
+  gl.uniform1i(u.uVelocity, tex(0, vel.read));
+  gl.uniform1i(u.uSource, tex(0, vel.read));
+  gl.uniform1f(u.dt, dt);
+  gl.uniform1f(u.dissipation, CFG.velDissipation + nu * 0.002);
+  blit(vel.write); vel.swap();
+
+  if (bodyActive) {
+    u = use(P.bodyDye);
+    setBodyUniforms(u);
+    gl.uniform1i(u.uTarget, tex(0, dye.read));
+    gl.uniform1f(u.uHue, now * 0.00004);
+    gl.uniform1f(u.uGain, CFG.bodyInk);
+    gl.uniform1f(u.uDt, dt);
+    gl.uniform1f(u.uRefSpeed, CFG.bodyInkSpeed);
+    blit(dye.write); dye.swap();
+  }
+
+  u = use(P.advect);
+  gl.uniform2f(u.texelSize, ...vel.texel);
+  gl.uniform1i(u.uVelocity, tex(0, vel.read));
+  gl.uniform1i(u.uSource, tex(1, dye.read));
+  gl.uniform1f(u.dt, dt);
+  gl.uniform1f(u.dissipation, CFG.dyeDissipation);
+  blit(dye.write); dye.swap();
+}
+
+function render() {
+  const u = use(P.display);
+  gl.uniform2f(u.texelSize, ...dye.texel);
+  gl.uniform1i(u.uDye, tex(0, dye.read));
+  gl.uniform1i(u.uVelocity, tex(1, vel.read));
+  gl.uniform1i(u.uPressure, tex(2, pressure.read));
+  gl.uniform1i(u.uCurl, tex(3, curl));
+  gl.uniform1i(u.uMask, tex(4, maskCur));
+  gl.uniform1i(u.uView, view);
+  // reference scales: 0.25 screen heights/s; eddies ~5% of the screen
+  const vRef = 0.25 * simH, lRef = 0.05 * simH;
+  gl.uniform1f(u.uVelScale, 1 / vRef);
+  gl.uniform1f(u.uPScale, 1 / (vRef * lRef));
+  gl.uniform1f(u.uCurlScale, lRef / vRef);
+  gl.uniform1f(u.uBody, showBody && mode === 'camera' && haveMask ? CFG.showBody : 0);
+  blit(null);
+}
+
+// attract mode: with nobody around, invisible hands stir the wall now and then
+function ghost(now) {
+  if (now - lastInput < CFG.idleSec * 1000 || presence > 0.01 || now < nextGhost) return;
+  nextGhost = now + 700 + Math.random() * 1500;
+  const x = 0.15 + 0.7 * Math.random(), y = 0.15 + 0.7 * Math.random();
+  const a = Math.random() * Math.PI * 2, s = (0.8 + Math.random()) * simH;
+  splat(x, y, Math.cos(a) * s, Math.sin(a) * s, hsv(Math.random(), 0.85, 0.35));
+}
+
+function hsv(h, s, v) {
+  h = ((h % 1) + 1) % 1;
+  const f = (n) => { const k = (n + h * 6) % 6; return v - v * s * Math.max(0, Math.min(k, 4 - k, 1)); };
+  return [f(5), f(3), f(1)];
+}
+
+// ---------- camera ----------
+async function startCamera() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' }, audio: false,
+    });
+    video.srcObject = stream;
+    await video.play();
+    const { FilesetResolver, ImageSegmenter } = await import(
+      'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs');
+    const fileset = await FilesetResolver.forVisionTasks(
+      'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm');
+    segmenter = await ImageSegmenter.createFromOptions(fileset, {
+      baseOptions: {
+        modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite',
+        delegate: 'GPU',
+      },
+      runningMode: 'VIDEO',
+      outputCategoryMask: false,
+      outputConfidenceMasks: true,
+    });
+    mode = 'camera';
+  } catch (err) {
+    console.warn('Camera unavailable, falling back to mouse:', err);
+    mode = 'mouse';
+  }
+}
+
+function segment(now) {
+  if (mode !== 'camera' || video.readyState < 2 || video.currentTime === lastVideoTime) {
+    if (now - lastSeg > 200) camInvDt = 0;   // camera stalled: stop pushing with a stale motion
+    return;
+  }
+  lastVideoTime = video.currentTime;
+  const result = segmenter.segmentForVideo(video, now);
+  const masks = result.confidenceMasks;
+  const m = masks[masks.length > 1 ? 1 : 0];
+  const mw = m.width, mh = m.height, data = m.getAsFloat32Array();
+  if (!maskU8 || maskU8.length !== data.length) { maskU8 = new Uint8Array(data.length); prevU8 = new Uint8Array(data.length); }
+  [maskU8, prevU8] = [prevU8, maskU8];
+  let on = 0, diff = 0;
+  for (let i = 0; i < data.length; i++) {
+    const v = invertMask ? 1 - data[i] : data[i];
+    maskU8[i] = Math.max(0, Math.min(255, v * 255));
+    if (v > 0.5) on++;
+    diff += Math.abs(maskU8[i] - prevU8[i]);
+  }
+  result.close();
+
+  const camDt = Math.max((now - lastSeg) / 1000, 1 / 60);
+  lastSeg = now;
+  presence += ((on / data.length) - presence) * 0.3;
+  // fraction of the frame swept by the silhouette per second
+  bodyMotionLevel += (diff / 255 / data.length / camDt * 4 - bodyMotionLevel) * 0.3;
+  if (presence > 0.01 && bodyMotionLevel > 0.1) lastInput = now;
+
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, camTex);
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, mw, mh, 0, gl.RED, gl.UNSIGNED_BYTE, maskU8);
+
+  [maskCur, maskPrev] = [maskPrev, maskCur];
+  const vw = video.videoWidth || mw, vh = video.videoHeight || mh;
+  const s = Math.max(W / vw, H / vh);
+  const u = use(P.maskPrep);
+  gl.uniform1i(u.uCam, tex(0, camTex));
+  gl.uniform2f(u.uScale, W / (vw * s), H / (vh * s));
+  gl.uniform1f(u.uRadius, CFG.maskRadius);
+  gl.uniform1f(u.uAspect, aspect);
+  gl.uniform1f(u.uInvert, 0);   // already applied on the CPU
+  blit(maskCur);
+  if (!haveMask) { blit(maskPrev); haveMask = true; camInvDt = 0; }
+  else camInvDt = 1 / camDt;
+}
+
+// ---------- HUD ----------
+const COL = { text: 'rgba(232,244,255,0.9)', dim: 'rgba(232,244,255,0.55)', lit: '#ffd27a' };
+const SERIF = 'ui-serif, "Cambria Math", "STIX Two Math", Georgia, serif';
+const SANS = 'ui-sans-serif, system-ui, -apple-system, sans-serif';
+const TERMS = [
+  { key: 'dt',  eq: '∂u/∂t',   say: 'The flow changes' },
+  { eq: ' + ' },
+  { key: 'adv', eq: '(u·∇)u',  say: 'because it carries itself,' },
+  { eq: '  =  ' },
+  { key: 'p',   eq: '−∇p',     say: 'is pushed by pressure,' },
+  { eq: ' + ' },
+  { key: 'nu',  eq: 'ν∇²u',    say: 'slowed by its own friction,' },
+  { eq: ' + ' },
+  { key: 'f',   eq: 'f',       say: 'and pushed by you.' },
+];
+const glow = { dt: 0, adv: 0, p: 0, nu: 0, f: 0 };
+
+function litColor(a) {
+  // dim white → warm gold
+  const r = 232 + (255 - 232) * a, g = 244 + (210 - 244) * a, b = 255 + (122 - 255) * a;
+  return `rgba(${r | 0},${g | 0},${b | 0},${0.45 + 0.55 * a})`;
+}
+
+function drawHud() {
+  const ctx = hctx, pad = Math.max(20, W * 0.02);
+  ctx.clearRect(0, 0, W, H);
+
+  if (showVideo && mode === 'camera') {
+    const vw = video.videoWidth, vh = video.videoHeight, s = Math.max(W / vw, H / vh);
+    ctx.save(); ctx.globalAlpha = 0.25; ctx.translate(W, 0); ctx.scale(-1, 1);
+    ctx.drawImage(video, (W - vw * s) / 2, (H - vh * s) / 2, vw * s, vh * s);
+    ctx.restore();
+  }
+  if (!showHud) return;
+
+  const targets = {
+    dt: Math.max(0.3, drive),
+    adv: view === 3 || view === 1 ? 1 : 0.3,
+    p: view === 2 ? 1 : 0.3,
+    nu: 0.15 + 0.85 * viscIndex / (CFG.viscosities.length - 1),
+    f: drive,
+  };
+  for (const k in glow) glow[k] += (targets[k] - glow[k]) * 0.08;
+
+  let g = ctx.createLinearGradient(0, H - 170, 0, H);
+  g.addColorStop(0, 'rgba(5,6,12,0)'); g.addColorStop(0.5, 'rgba(5,6,12,0.7)'); g.addColorStop(1, 'rgba(5,6,12,0.85)');
+  ctx.fillStyle = g; ctx.fillRect(0, H - 170, W, 170);
+  g = ctx.createLinearGradient(0, 0, 0, pad + 90);
+  g.addColorStop(0, 'rgba(5,6,12,0.75)'); g.addColorStop(1, 'rgba(5,6,12,0)');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, pad + 90);
+
+  // title
+  ctx.textBaseline = 'alphabetic'; ctx.textAlign = 'left';
+  ctx.fillStyle = 'rgba(232,244,255,0.85)';
+  ctx.font = `300 22px ${SERIF}`;
+  ctx.fillText('Every swirl you make obeys one equation.', pad, pad + 22);
+  ctx.font = `400 13px ${SANS}`;
+  ctx.fillStyle = COL.dim;
+  ctx.fillText('Claude-Louis Navier, 1822  ·  George Gabriel Stokes, 1845', pad, pad + 44);
+
+  // the equation, each term glowing with what it is doing right now
+  const big = Math.min(32, W / 26);
+  let x = pad;
+  const yEq = H - pad - 74, ySay = H - pad - 44;
+  ctx.font = `italic 400 ${big}px ${SERIF}`;
+  for (const t of TERMS) {
+    const w = ctx.measureText(t.eq).width;
+    if (t.key) {
+      const a = glow[t.key];
+      ctx.save();
+      ctx.shadowColor = `rgba(255,210,122,${0.8 * a * a})`; ctx.shadowBlur = 18 * a;
+      ctx.fillStyle = litColor(a);
+      ctx.fillText(t.eq, x, yEq);
+      ctx.restore();
+    } else {
+      ctx.fillStyle = COL.dim; ctx.fillText(t.eq, x, yEq);
+    }
+    x += w;
+  }
+  x = pad;
+  ctx.font = `400 14px ${SANS}`;
+  for (const t of TERMS) {
+    if (!t.say) continue;
+    ctx.fillStyle = litColor(glow[t.key]);
+    ctx.fillText(t.say, x, ySay);
+    x += ctx.measureText(t.say + ' ').width;
+  }
+  ctx.font = `italic 400 ${Math.round(big * 0.7)}px ${SERIF}`;
+  ctx.fillStyle = COL.text;
+  ctx.fillText('∇·u = 0', pad, H - pad - 6);
+  const cw = ctx.measureText('∇·u = 0').width;
+  ctx.font = `400 13px ${SANS}`;
+  ctx.fillStyle = COL.dim;
+  ctx.fillText('…and it can’t be squeezed: whatever flows in must flow out.', pad + cw + 16, H - pad - 6);
+
+  // top right: view selector, viscosity dial, input status
+  ctx.textAlign = 'right';
+  let rx = W - pad;
+  ctx.font = `400 13px ${SANS}`;
+  for (let i = VIEWS.length - 1; i >= 0; i--) {
+    const label = `${i + 1} ${VIEWS[i]}`;
+    ctx.fillStyle = i === view ? COL.lit : COL.dim;
+    ctx.fillText(label, rx, pad + 16);
+    rx -= ctx.measureText(label).width + 18;
+  }
+  const n = CFG.viscosities.length, dotGap = 14, dotsW = (n - 1) * dotGap;
+  const dy = pad + 42;
+  ctx.fillStyle = COL.dim;
+  ctx.fillText('honey', W - pad, dy);
+  const dx0 = W - pad - ctx.measureText('honey').width - 14 - dotsW;
+  for (let i = 0; i < n; i++) {
+    ctx.beginPath(); ctx.arc(dx0 + i * dotGap, dy - 4.5, i === viscIndex ? 4.5 : 2.5, 0, Math.PI * 2);
+    ctx.fillStyle = i === viscIndex ? COL.lit : 'rgba(232,244,255,0.35)'; ctx.fill();
+  }
+  ctx.fillStyle = COL.dim;
+  ctx.fillText('[  water', dx0 - 12, dy);
+  ctx.textAlign = 'left'; ctx.fillText(']', W - pad + 6, dy); ctx.textAlign = 'right';
+  if (mode !== 'camera') ctx.fillText(mode === 'loading' ? 'starting camera…' : 'no camera — move the mouse or touch the wall', W - pad, pad + 66);
+
+  if (W > 1100) {
+    ctx.fillStyle = 'rgba(232,244,255,0.4)';
+    ctx.font = `400 12px ${SANS}`;
+    ctx.fillText('Nobody knows whether these equations always have smooth solutions.', W - pad, H - pad - 24);
+    ctx.fillText('It is one of the seven Millennium Prize Problems — worth $1,000,000.', W - pad, H - pad - 6);
+  }
+  ctx.textAlign = 'left';
+}
+
+// ---------- main loop ----------
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min((now - last) / 1000, 1 / 30);
+  last = now;
+  segment(now);
+  ghost(now);
+  step(dt, now);
+  render();
+  drawHud();
+  requestAnimationFrame(frame);
+}
+
+function pointer(e) {
+  let p = pointers.get(e.pointerId);
+  if (!p) {
+    p = { x: e.clientX, y: e.clientY, px: e.clientX, py: e.clientY, hue: Math.random() };
+    pointers.set(e.pointerId, p);
+  }
+  p.x = e.clientX; p.y = e.clientY;
+  lastInput = performance.now();
+}
+window.addEventListener('pointerdown', pointer);
+window.addEventListener('pointermove', pointer);
+for (const ev of ['pointerup', 'pointercancel', 'pointerout'])
+  window.addEventListener(ev, e => { if (e.pointerType !== 'mouse' || ev === 'pointerout') pointers.delete(e.pointerId); });
+window.addEventListener('resize', resize);
+window.addEventListener('keydown', e => {
+  if (e.key >= '1' && e.key <= String(VIEWS.length)) view = +e.key - 1;
+  else if (e.key === ' ') { view = (view + 1) % VIEWS.length; e.preventDefault(); }
+  else if (e.key === '[') viscIndex = Math.max(0, viscIndex - 1);
+  else if (e.key === ']') viscIndex = Math.min(CFG.viscosities.length - 1, viscIndex + 1);
+  else if (e.key === 'r') reset();
+  else if (e.key === 'v') showVideo = !showVideo;
+  else if (e.key === 'b') showBody = !showBody;
+  else if (e.key === 'h') showHud = !showHud;
+  else if (e.key === 'i') invertMask = !invertMask;
+  else if (e.key === 'm') mode = mode === 'mouse' && segmenter ? 'camera' : 'mouse';
+  else if (e.key === 'f') document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen();
+});
+
+// Debug hook for tuning from the console: navierStokes.state(), navierStokes.CFG
+window.navierStokes = {
+  CFG,
+  state() {
+    return { mode, view: VIEWS[view], viscosity: CFG.viscosities[viscIndex], presence, bodyMotionLevel, drive,
+             sim: [simW, simH], dye: [dye.w, dye.h] };
+  },
+};
+
+resize();
+requestAnimationFrame(frame);
+startCamera();
+</script>
+</body>
+</html>

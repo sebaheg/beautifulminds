@@ -1,0 +1,558 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Noether — Symmetry and Conservation</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #05060c; overflow: hidden; }
+  canvas { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; }
+  video { display: none; }
+</style>
+</head>
+<body>
+<canvas id="sim"></canvas>
+<canvas id="hud"></canvas>
+<video id="cam" playsinline muted></video>
+
+<script type="module">
+// Emmy Noether — "You break the symmetry"
+//
+// A river of free particles flows across a periodic (wrap-around) universe.
+// With nobody present the laws are the same everywhere and at every moment,
+// so total momentum and total energy stay fixed. A visitor's silhouette becomes
+// a wall the particles bounce off: it exists *here* and not *there* (breaks
+// translation symmetry -> particle momentum changes) and, when the visitor moves,
+// it changes in time (breaks time symmetry -> particle energy changes). Every bit
+// of momentum and energy the particles lose or gain is booked to "you", so the
+// totals stay constant — the exchange, not a violation.
+
+const CFG = {
+  particles: 4000,
+  flow: 0.07,          // drift speed, fraction of screen width per second
+  gridW: 160,          // silhouette field resolution (height follows aspect)
+  blurPasses: 3,
+  blurRadius: 3,       // a wide soft edge, so a hand that jumps between camera frames still
+                       // lands with particles inside its edge band rather than its interior
+  wallLevel: 0.15,     // particles bounce where the blurred silhouette exceeds this
+  minGrad: 0.002,      // per px; below this the edge direction is unreliable (deep inside the body)
+  maxWallSpeed: 15,    // cap on the estimated wall speed, in river speeds
+  maxKickSpeed: 6,     // a moving wall can't bat a particle faster than this (river speeds);
+                       // the excess is absorbed by you. A still wall never hits this cap.
+  momentumScale: 0.6,  // a momentum change of this fraction of the river's fills the compass
+  movingRate: 1.0,     // fraction of your silhouette changing per second that counts as "moving"
+  mouseLingerMs: 3000, // in camera mode, the mouse body stays this long after the mouse last moved
+  edge: 0.05,          // fade the silhouette out near screen edges
+  smoothing: 0.7,      // temporal smoothing of the silhouette (1 = none)
+  substeps: 2,
+  emptyResetSec: 10,   // reset the universe after this long with nobody present
+  historyLen: 360,
+};
+
+// ---------- canvases ----------
+const sim = document.getElementById('sim'), sctx = sim.getContext('2d');
+const hud = document.getElementById('hud'), hctx = hud.getContext('2d');
+const video = document.getElementById('cam');
+let W = 0, H = 0, dpr = 1;
+
+// ---------- particles ----------
+const N = CFG.particles;
+const px = new Float64Array(N), py = new Float64Array(N);
+const vx = new Float64Array(N), vy = new Float64Array(N);
+let v0 = 1, P0x = 0, P0y = 0, E0 = 1;
+let youPx = 0, youPy = 0, youE = 0;
+
+// ---------- silhouette field: B is the blurred body, (nx, ny) the outward edge normal,
+// un the speed at which the edge moves along that normal ----------
+let gw = CFG.gridW, gh = 90;
+let B, Bnext, raw, tmp, win, nx, ny, un;
+let presence = 0, changeRate = 0;
+
+// ---------- input ----------
+let mode = 'loading';            // 'camera' | 'mouse' | 'loading'
+let segmenter = null, mask = null, mw = 0, mh = 0, lastVideoTime = -1;
+let invertMask = false, showVideo = false, showHud = true;
+let mouse = { x: 0, y: 0, inside: false, lastMove: -Infinity };
+let cameraError = '';
+
+// ---------- history ----------
+const hist = { p: [], y: [], t: [] };
+let emptyTime = 0, fade = 1, fading = 0;
+
+function resize() {
+  dpr = Math.min(window.devicePixelRatio || 1, 2);
+  W = window.innerWidth; H = window.innerHeight;
+  for (const c of [sim, hud]) { c.width = W * dpr; c.height = H * dpr; }
+  sctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  hctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  gw = CFG.gridW; gh = Math.max(2, Math.round(gw * H / W));
+  [B, Bnext, raw, tmp, win, nx, ny, un] = Array.from({ length: 8 }, () => new Float32Array(gw * gh));
+  for (let j = 0; j < gh; j++) for (let i = 0; i < gw; i++) {
+    const e = CFG.edge;
+    const fx = Math.min(1, Math.min((i + 0.5) / gw, 1 - (i + 0.5) / gw) / e);
+    const fy = Math.min(1, Math.min((j + 0.5) / gh, 1 - (j + 0.5) / gh) / (e * W / H));
+    const s = Math.min(fx, fy);
+    win[j * gw + i] = s * s * (3 - 2 * s);
+  }
+  reset();
+}
+
+function reset() {
+  v0 = CFG.flow * W;
+  for (let i = 0; i < N; i++) {
+    px[i] = Math.random() * W; py[i] = Math.random() * H;
+    vx[i] = v0 * (1 + 0.08 * (Math.random() - 0.5));
+    vy[i] = v0 * 0.04 * (Math.random() - 0.5);
+  }
+  youPx = youPy = youE = 0;
+  [P0x, P0y] = particleMomentum();
+  E0 = particleEnergy();
+  hist.p.length = hist.y.length = hist.t.length = 0;
+  sctx.fillStyle = '#05060c'; sctx.fillRect(0, 0, W, H);
+}
+
+function particleMomentum() {
+  let sx = 0, sy = 0;
+  for (let i = 0; i < N; i++) { sx += vx[i]; sy += vy[i]; }
+  return [sx, sy];
+}
+function particleEnergy() {
+  let e = 0;
+  for (let i = 0; i < N; i++) e += 0.5 * (vx[i] * vx[i] + vy[i] * vy[i]);
+  return e;
+}
+
+// ---------- physics: free flight on a torus, bouncing off the (moving) body ----------
+function step(dt) {
+  let dpx = 0, dpy = 0, dE = 0;
+  for (let i = 0; i < N; i++) {
+    let x = px[i] + vx[i] * dt, y = py[i] + vy[i] * dt;
+    x -= Math.floor(x / W) * W; y -= Math.floor(y / H) * H;
+    px[i] = x; py[i] = y;
+
+    const k = Math.min(gh - 1, (y / H * gh) | 0) * gw + Math.min(gw - 1, (x / W * gw) | 0);
+    if (B[k] < CFG.wallLevel || (nx[k] === 0 && ny[k] === 0)) continue;
+    // Reflect off the wall in the wall's own frame: approaching at relative normal
+    // speed `rel`, leave at -rel. A still wall returns the same speed; a moving one bats.
+    const rel = vx[i] * nx[k] + vy[i] * ny[k] - un[k];
+    if (rel >= 0) continue;
+    const e0 = 0.5 * (vx[i] * vx[i] + vy[i] * vy[i]);
+    let ux = vx[i] - 2 * rel * nx[k], uy = vy[i] - 2 * rel * ny[k];
+    const s1 = Math.hypot(ux, uy), cap = Math.max(Math.sqrt(2 * e0), CFG.maxKickSpeed * v0);
+    if (s1 > cap) { ux *= cap / s1; uy *= cap / s1; }
+    const ddx = ux - vx[i], ddy = uy - vy[i];
+    vx[i] = ux; vy[i] = uy;
+    dpx += ddx; dpy += ddy;
+    dE += 0.5 * (vx[i] * vx[i] + vy[i] * vy[i]) - e0;
+  }
+  // Newton's third law: whatever the particles gain, the body loses.
+  youPx -= dpx; youPy -= dpy; youE -= dE;
+}
+
+// ---------- building the field from the silhouette ----------
+function boxBlur(src, dst, r) {
+  for (let j = 0; j < gh; j++) {
+    let acc = 0;
+    for (let i = -r; i <= r; i++) acc += src[j * gw + Math.max(0, Math.min(gw - 1, i))];
+    for (let i = 0; i < gw; i++) {
+      dst[j * gw + i] = acc / (2 * r + 1);
+      acc += src[j * gw + Math.min(gw - 1, i + r + 1)] - src[j * gw + Math.max(0, i - r)];
+    }
+  }
+  for (let i = 0; i < gw; i++) {
+    let acc = 0;
+    for (let j = -r; j <= r; j++) acc += dst[Math.max(0, Math.min(gh - 1, j)) * gw + i];
+    for (let j = 0; j < gh; j++) {
+      src[j * gw + i] = acc / (2 * r + 1);
+      acc += dst[Math.min(gh - 1, j + r + 1) * gw + i] - dst[Math.max(0, j - r) * gw + i];
+    }
+  }
+}
+
+function sampleSilhouette() {
+  if (mode === 'camera' && mask) {
+    const vw = video.videoWidth || mw, vh = video.videoHeight || mh;
+    const s = Math.max(W / vw, H / vh), dw = vw * s, dh = vh * s;
+    const ox = (W - dw) / 2, oy = (H - dh) / 2;
+    for (let j = 0; j < gh; j++) {
+      const v = ((j + 0.5) / gh * H - oy) / dh;
+      const my = Math.max(0, Math.min(mh - 1, (v * mh) | 0));
+      for (let i = 0; i < gw; i++) {
+        const u = 1 - ((i + 0.5) / gw * W - ox) / dw;   // mirrored
+        const mx = Math.max(0, Math.min(mw - 1, (u * mw) | 0));
+        const m = mask[my * mw + mx];
+        raw[j * gw + i] = (invertMask ? 1 - m : m) > 0.5 ? 1 : 0;
+      }
+    }
+  } else {
+    raw.fill(0);
+  }
+  // The mouse is a hand-sized body on top of whatever the camera sees — always in
+  // mouse mode, and in camera mode for a few seconds after it last moved.
+  const mouseActive = mouse.inside && (mode === 'mouse' ||
+    (mode !== 'off' && performance.now() - mouse.lastMove < CFG.mouseLingerMs));
+  if (mouseActive) {
+    const r = 0.11 * H;
+    for (let j = 0; j < gh; j++) for (let i = 0; i < gw; i++) {
+      const dx = (i + 0.5) / gw * W - mouse.x, dy = (j + 0.5) / gh * H - mouse.y;
+      if (dx * dx + dy * dy < 0.92 * r * r) raw[j * gw + i] = 1;
+    }
+  }
+  for (let p = 0; p < CFG.blurPasses; p++) boxBlur(raw, tmp, CFG.blurRadius);
+}
+
+function updateField(dtFrame) {
+  sampleSilhouette();
+  dtFrame = Math.max(dtFrame, 1e-3);
+  let maxB = 0, dsum = 0, bsum = 0;
+  for (let k = 0; k < B.length; k++) {
+    Bnext[k] = B[k] + (raw[k] * win[k] - B[k]) * CFG.smoothing;
+    if (Bnext[k] > maxB) maxB = Bnext[k];
+    dsum += Math.abs(Bnext[k] - B[k]); bsum += Bnext[k];
+  }
+  // Edge normal from the gradient, edge speed from how fast the field rises or falls:
+  // for a shape sliding along, dB/dt = -u·∇B, so the outward normal speed is (dB/dt)/|∇B|.
+  const cw = W / gw, ch = H / gh, umax = CFG.maxWallSpeed * v0;
+  for (let j = 0; j < gh; j++) for (let i = 0; i < gw; i++) {
+    const k = j * gw + i;
+    const gx = (Bnext[k + (i < gw - 1 ? 1 : 0)] - Bnext[k - (i > 0 ? 1 : 0)]) / (2 * cw);
+    const gy = (Bnext[k + (j < gh - 1 ? gw : 0)] - Bnext[k - (j > 0 ? gw : 0)]) / (2 * ch);
+    const g = Math.hypot(gx, gy);
+    if (g < CFG.minGrad) { nx[k] = ny[k] = un[k] = 0; continue; }
+    nx[k] = -gx / g; ny[k] = -gy / g;
+    un[k] = Math.max(-umax, Math.min(umax, (Bnext[k] - B[k]) / dtFrame / g));
+  }
+  [B, Bnext] = [Bnext, B];
+
+  presence += ((maxB > 0.3 ? 1 : 0) - presence) * 0.2;
+  // Fraction of your body that changed per second.
+  const rate = bsum > 1 ? dsum / bsum / dtFrame : 0;
+  changeRate += (rate - changeRate) * 0.15;
+}
+
+// ---------- camera ----------
+async function openStream() {
+  video.srcObject = await navigator.mediaDevices.getUserMedia({
+    video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' }, audio: false,
+  });
+  await video.play();
+  lastVideoTime = -1;
+}
+
+function closeStream() {
+  if (video.srcObject) for (const t of video.srcObject.getTracks()) t.stop();
+  video.srcObject = null;
+}
+
+// Switch the body off (camera released, universe flat and symmetric again) and back on.
+let modeBeforeOff = 'camera';
+async function toggleInput() {
+  if (mode === 'off') {
+    if (modeBeforeOff === 'camera') {
+      try { await openStream(); } catch (err) { console.warn('Could not reopen camera:', err); return; }
+    }
+    mode = modeBeforeOff;
+  } else if (mode === 'camera' || mode === 'mouse') {
+    modeBeforeOff = mode;
+    if (mode === 'camera') closeStream();
+    mode = 'off';
+  }
+}
+
+async function startCamera() {
+  try {
+    await openStream();
+    const { FilesetResolver, ImageSegmenter } = await import(
+      'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs');
+    const fileset = await FilesetResolver.forVisionTasks(
+      'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm');
+    segmenter = await ImageSegmenter.createFromOptions(fileset, {
+      baseOptions: {
+        modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite',
+        delegate: 'GPU',
+      },
+      runningMode: 'VIDEO',
+      outputCategoryMask: false,
+      outputConfidenceMasks: true,
+    });
+    mode = 'camera';
+  } catch (err) {
+    console.warn('Camera unavailable, falling back to mouse:', err);
+    cameraError = err && err.name === 'NotAllowedError' ? 'camera blocked' : 'no camera';
+    mode = 'mouse';
+  }
+}
+
+function segment() {
+  if (mode !== 'camera' || video.readyState < 2 || video.currentTime === lastVideoTime) return false;
+  lastVideoTime = video.currentTime;
+  const result = segmenter.segmentForVideo(video, performance.now());
+  const masks = result.confidenceMasks;
+  const m = masks[masks.length > 1 ? 1 : 0];
+  mw = m.width; mh = m.height;
+  const data = m.getAsFloat32Array();
+  if (!mask || mask.length !== data.length) mask = new Float32Array(data.length);
+  mask.set(data);
+  result.close();
+  return true;
+}
+
+// ---------- rendering ----------
+const PALETTE = ['#2f5bff', '#4f93ff', '#8fd3ff', '#e8f4ff', '#ffd27a', '#ff9a4a', '#ff4f6a'];
+const buckets = PALETTE.map(() => []);
+const silCanvas = document.createElement('canvas'), silCtx = silCanvas.getContext('2d');
+
+function drawParticles() {
+  sctx.globalCompositeOperation = 'source-over';
+  sctx.fillStyle = 'rgba(5,6,12,0.2)';
+  sctx.fillRect(0, 0, W, H);
+  for (const b of buckets) b.length = 0;
+  for (let i = 0; i < N; i++) {
+    const r = Math.hypot(vx[i], vy[i]) / v0;
+    const k = Math.max(0, Math.min(PALETTE.length - 1, Math.round((r - 0.4) * 2.2)));
+    buckets[k].push(i);
+  }
+  sctx.globalCompositeOperation = 'lighter';
+  sctx.globalAlpha = 0.85 * fade;
+  for (let k = 0; k < PALETTE.length; k++) {
+    sctx.fillStyle = PALETTE[k];
+    sctx.beginPath();
+    for (const i of buckets[k]) sctx.rect(px[i] - 0.9, py[i] - 0.9, 1.8, 1.8);
+    sctx.fill();
+  }
+  sctx.globalAlpha = 1;
+}
+
+function drawSilhouette() {
+  if (showVideo && mode === 'camera') {
+    const vw = video.videoWidth, vh = video.videoHeight;
+    const s = Math.max(W / vw, H / vh), dw = vw * s, dh = vh * s;
+    hctx.save(); hctx.globalAlpha = 0.25;
+    hctx.translate(W, 0); hctx.scale(-1, 1);
+    hctx.drawImage(video, (W - dw) / 2, (H - dh) / 2, dw, dh);
+    hctx.restore();
+  }
+  if (silCanvas.width !== gw || silCanvas.height !== gh) { silCanvas.width = gw; silCanvas.height = gh; }
+  const img = silCtx.createImageData(gw, gh);
+  for (let k = 0; k < B.length; k++) {
+    // A faint fill plus a bright rim right where particles bounce, so you can see yourself.
+    const fill = Math.min(1, B[k] / 0.5) * 55;
+    const d = (B[k] - CFG.wallLevel - 0.08) / 0.09, rim = B[k] > 0.02 ? Math.exp(-d * d) * 200 : 0;
+    img.data[k * 4] = 170; img.data[k * 4 + 1] = 140; img.data[k * 4 + 2] = 255;
+    img.data[k * 4 + 3] = Math.min(255, fill + rim);
+  }
+  silCtx.putImageData(img, 0, 0);
+  hctx.imageSmoothingEnabled = true; hctx.imageSmoothingQuality = 'high';
+  hctx.drawImage(silCanvas, 0, 0, W, H);
+}
+
+const COL = { particles: '#e8f4ff', you: '#ffc86b', total: '#6cf2d2', dim: 'rgba(232,244,255,0.55)' };
+
+function arrow(ctx, x0, y0, x1, y1, color, width, dashed) {
+  const len = Math.hypot(x1 - x0, y1 - y0);
+  ctx.save();
+  ctx.strokeStyle = ctx.fillStyle = color; ctx.lineWidth = width; ctx.lineCap = 'round';
+  if (dashed) ctx.setLineDash([5, 5]);
+  ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke();
+  ctx.setLineDash([]);
+  if (len > 6) {
+    const a = Math.atan2(y1 - y0, x1 - x0), s = 7 + width;
+    ctx.beginPath();
+    ctx.moveTo(x1, y1);
+    ctx.lineTo(x1 - s * Math.cos(a - 0.45), y1 - s * Math.sin(a - 0.45));
+    ctx.lineTo(x1 - s * Math.cos(a + 0.45), y1 - s * Math.sin(a + 0.45));
+    ctx.closePath(); ctx.fill();
+  }
+  ctx.restore();
+}
+
+function statusLine(ctx, x, y, ok, okText, brokenText) {
+  ctx.fillStyle = ok ? COL.total : COL.you;
+  ctx.beginPath(); ctx.arc(x + 5, y - 4, 4.5, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = COL.dim;
+  ctx.fillText(ok ? okText : brokenText, x + 18, y);
+}
+
+function drawHud() {
+  const ctx = hctx;
+  const pad = Math.max(20, W * 0.02);
+  const panelH = 200;
+  const y0 = H - panelH - pad;
+
+  // Darken behind the text so it stays legible over the river.
+  let g = ctx.createLinearGradient(0, y0 - 40, 0, H);
+  g.addColorStop(0, 'rgba(5,6,12,0)'); g.addColorStop(0.35, 'rgba(5,6,12,0.75)'); g.addColorStop(1, 'rgba(5,6,12,0.9)');
+  ctx.fillStyle = g; ctx.fillRect(0, y0 - 40, W, H - y0 + 40);
+  g = ctx.createLinearGradient(0, 0, 0, pad + 80);
+  g.addColorStop(0, 'rgba(5,6,12,0.8)'); g.addColorStop(1, 'rgba(5,6,12,0)');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, pad + 80);
+
+  ctx.font = '600 13px ui-sans-serif, system-ui, -apple-system, sans-serif';
+  ctx.textBaseline = 'alphabetic';
+
+  // Title
+  ctx.fillStyle = 'rgba(232,244,255,0.85)';
+  ctx.font = '300 22px ui-serif, Georgia, serif';
+  ctx.fillText('Every symmetry hides a conservation law.', pad, pad + 22);
+  ctx.font = '400 13px ui-sans-serif, system-ui, -apple-system, sans-serif';
+  ctx.fillStyle = COL.dim;
+  ctx.fillText('Emmy Noether, 1918', pad, pad + 44);
+
+  const spaceSym = presence < 0.5;
+  const timeSym = changeRate < CFG.movingRate;
+
+  // --- Momentum compass ---
+  const R = 72, cx = pad + R, cy = y0 + 20 + R;
+  const [ppx, ppy] = particleMomentum();
+  // Show what has been exchanged since the universe began, not the river's (huge) total:
+  // the particles' change and yours are always equal and opposite, and their sum stays at zero.
+  const P0 = Math.hypot(P0x, P0y) || 1, sc = R / (CFG.momentumScale * P0);
+  const clampV = (x, y) => { const l = Math.hypot(x, y), m = R * 1.1; return l > m ? [x * m / l, y * m / l] : [x, y]; };
+  ctx.strokeStyle = 'rgba(232,244,255,0.15)'; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.arc(cx, cy, R, 0, Math.PI * 2); ctx.stroke();
+  ctx.beginPath(); ctx.arc(cx, cy, R * 0.5, 0, Math.PI * 2); ctx.stroke();
+  let [ax, ay] = clampV(youPx * sc, youPy * sc);
+  arrow(ctx, cx, cy, cx + ax, cy + ay, COL.you, 3);
+  [ax, ay] = clampV((ppx - P0x) * sc, (ppy - P0y) * sc);
+  arrow(ctx, cx, cy, cx + ax, cy + ay, COL.particles, 3);
+  [ax, ay] = clampV((ppx + youPx - P0x) * sc, (ppy + youPy - P0y) * sc);
+  ctx.fillStyle = COL.total;
+  ctx.beginPath(); ctx.arc(cx + ax, cy + ay, 4, 0, Math.PI * 2); ctx.fill();
+
+  const tx = cx + R + 24;
+  ctx.font = '600 12px ui-sans-serif, system-ui, -apple-system, sans-serif';
+  ctx.fillStyle = 'rgba(232,244,255,0.9)';
+  ctx.fillText('MOMENTUM GIVEN AND TAKEN', tx, y0 + 34);
+  ctx.font = '400 13px ui-sans-serif, system-ui, -apple-system, sans-serif';
+  statusLine(ctx, tx, y0 + 60, spaceSym, 'Space is the same everywhere', 'You make space uneven');
+  ctx.fillStyle = COL.dim;
+  ctx.fillText(spaceSym ? '→ the particles’ momentum is fixed' : '→ momentum flows between you and the particles', tx + 18, y0 + 80);
+
+  // --- Energy chart ---
+  const chartW = Math.min(360, W * 0.3), chartH = 110;
+  const ex = W - pad - chartW, ey = y0 + 40;
+  const Ep = particleEnergy();
+  hist.p.push(Ep / E0); hist.y.push(youE / E0); hist.t.push((Ep + youE) / E0);
+  for (const k in hist) if (hist[k].length > CFG.historyLen) hist[k].shift();
+  let lo = 0, hi = 1.2;
+  for (const k in hist) for (const v of hist[k]) { if (v < lo) lo = v; if (v > hi) hi = v; }
+  const yOf = v => ey + chartH - (v - lo) / (hi - lo) * chartH;
+  ctx.strokeStyle = 'rgba(232,244,255,0.15)';
+  ctx.beginPath(); ctx.moveTo(ex, yOf(0)); ctx.lineTo(ex + chartW, yOf(0)); ctx.stroke();
+  const line = (arr, color, width, dashed) => {
+    ctx.save(); ctx.strokeStyle = color; ctx.lineWidth = width; if (dashed) ctx.setLineDash([5, 5]);
+    ctx.beginPath();
+    arr.forEach((v, i) => { const x = ex + i / (CFG.historyLen - 1) * chartW; i ? ctx.lineTo(x, yOf(v)) : ctx.moveTo(x, yOf(v)); });
+    ctx.stroke(); ctx.restore();
+  };
+  line(hist.y, COL.you, 2);
+  line(hist.p, COL.particles, 2);
+  line(hist.t, COL.total, 1.5, true);
+
+  ctx.font = '600 12px ui-sans-serif, system-ui, -apple-system, sans-serif';
+  ctx.fillStyle = 'rgba(232,244,255,0.9)';
+  ctx.fillText('ENERGY', ex, y0 + 14);
+  ctx.font = '400 13px ui-sans-serif, system-ui, -apple-system, sans-serif';
+  statusLine(ctx, ex, ey + chartH + 28, timeSym, 'The laws are the same at every moment', 'You change the laws over time');
+  ctx.fillStyle = COL.dim;
+  ctx.fillText(timeSym ? '→ the particles’ energy is fixed' : '→ energy flows between you and the particles', ex + 18, ey + chartH + 48);
+
+  // --- Legend ---
+  const lx = pad, ly = H - pad + 4;
+  let x = lx;
+  ctx.font = '400 12px ui-sans-serif, system-ui, -apple-system, sans-serif';
+  for (const [label, color, dashed] of [['particles', COL.particles], ['you', COL.you], ['total (never changes)', COL.total, true]]) {
+    ctx.save(); ctx.strokeStyle = color; ctx.lineWidth = 2; if (dashed) ctx.setLineDash([4, 4]);
+    ctx.beginPath(); ctx.moveTo(x, ly - 4); ctx.lineTo(x + 18, ly - 4); ctx.stroke(); ctx.restore();
+    ctx.fillStyle = COL.dim; ctx.fillText(label, x + 24, ly);
+    x += 24 + ctx.measureText(label).width + 22;
+  }
+
+  ctx.textAlign = 'right';
+  ctx.fillStyle = COL.dim;
+  ctx.fillText({
+    loading: 'starting camera… (allow camera access) — the mouse works meanwhile',
+    camera: presence > 0.5 ? 'camera on — you are in the river · C turns it off'
+                           : 'camera on — step in front of it, or move the mouse · C turns it off',
+    mouse: (cameraError || 'no camera') + ' — move the mouse into the river',
+    off: (modeBeforeOff === 'camera' ? 'camera off' : 'mouse off') + ' — space is flat again · C to step back in',
+  }[mode], W - pad, pad + 16);
+  ctx.textAlign = 'left';
+}
+
+// ---------- main loop ----------
+let last = performance.now(), lastField = last;
+function frame(now) {
+  const dt = Math.min((now - last) / 1000, 1 / 30);
+  last = now;
+
+  // Off/loading still update every frame, so the silhouette fades and space goes flat.
+  const fresh = mode === 'camera' ? segment() : true;
+  if (fresh) { updateField((now - lastField) / 1000); lastField = now; }
+
+  for (let s = 0; s < CFG.substeps; s++) step(dt / CFG.substeps);
+
+  // Reset the universe after a while with nobody in it.
+  if (presence < 0.05) emptyTime += dt; else emptyTime = 0;
+  if (fading === 0 && emptyTime > CFG.emptyResetSec) {
+    const [ppx, ppy] = particleMomentum();
+    const drift = Math.hypot(ppx - P0x, ppy - P0y) / Math.hypot(P0x, P0y) + Math.abs(particleEnergy() / E0 - 1);
+    if (drift > 0.05) fading = -1;
+    emptyTime = 0;
+  }
+  if (fading) {
+    fade += fading * dt;
+    if (fade <= 0) { fade = 0; reset(); fading = 1; }
+    if (fade >= 1) { fade = 1; fading = 0; }
+  }
+
+  drawParticles();
+  hctx.clearRect(0, 0, W, H);
+  drawSilhouette();
+  if (showHud) drawHud();
+  requestAnimationFrame(frame);
+}
+
+window.addEventListener('resize', resize);
+window.addEventListener('mousemove', e => {
+  mouse.x = e.clientX; mouse.y = e.clientY; mouse.inside = true; mouse.lastMove = performance.now();
+});
+document.addEventListener('mouseleave', () => { mouse.inside = false; });
+window.addEventListener('keydown', e => {
+  if (e.key === 'r') reset();
+  else if (e.key === 'v') showVideo = !showVideo;
+  else if (e.key === 'h') showHud = !showHud;
+  else if (e.key === 'i') invertMask = !invertMask;
+  else if (e.key === 'c') toggleInput();
+  else if (e.key === 'm') {
+    if (mode === 'mouse' && segmenter) { mode = 'off'; modeBeforeOff = 'camera'; toggleInput(); }
+    else if (mode !== 'mouse') { if (mode === 'camera') closeStream(); mode = 'mouse'; }
+  }
+  else if (e.key === 'f') document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen();
+});
+
+// Debug hook for tuning from the console: noether.state(), noether.CFG
+window.noether = {
+  CFG,
+  state() {
+    const [ppx, ppy] = particleMomentum(), Ep = particleEnergy();
+    return {
+      mode, presence, changeRate,
+      camera: {
+        videoTime: video.currentTime, readyState: video.readyState, size: [video.videoWidth, video.videoHeight],
+        mask: mask && { w: mw, h: mh, mean: mask.reduce((a, b) => a + b, 0) / mask.length,
+                        above05: mask.reduce((a, b) => a + (b > 0.5), 0) / mask.length },
+      },
+      momentum: { particles: [ppx / Math.hypot(P0x, P0y), ppy / Math.hypot(P0x, P0y)],
+                  total: [(ppx + youPx - P0x) / Math.hypot(P0x, P0y), (ppy + youPy - P0y) / Math.hypot(P0x, P0y)] },
+      energy: { particles: Ep / E0, you: youE / E0, total: (Ep + youE) / E0 },
+    };
+  },
+};
+
+resize();
+requestAnimationFrame(frame);
+startCamera();
+</script>
+</body>
+</html>
